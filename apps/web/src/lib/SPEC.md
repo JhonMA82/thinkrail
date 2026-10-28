@@ -77,7 +77,10 @@ not this module; the theme-aware highlighter remains app-local.
   `highlighter.ts` owns the curated grammar/id/file-association catalog shared by chat and the desktop
   Monaco renderer (both load a grammar on its language's first use), plus
   `createChatHighlighter(engine)`: `themes`' one generic CSS-variable registration and each chat grammar
-  loaded on first use. Chat code is highlighted off the main thread:
+  loaded on first use. It is not the only language table: the resource descriptor
+  ([[module-resource-renderers]]) and `@thinkrail/extension-api`'s `languageFromPath` keep their own small
+  extension maps for the Pierre and chat-tool-card consumers they serve, so a new language is declared in
+  all three until those maps are unified (deferred). Chat code is highlighted off the main thread:
   `highlightCode.ts` resolves the language alias (unknown and `mermaid` answer `null` with no worker),
   then posts to one lazy `highlighter.worker.ts` per page, which uses the Oniguruma WASM engine. Per
   caller key at most one request is in flight; a newer call replaces the waiting one, which resolves
