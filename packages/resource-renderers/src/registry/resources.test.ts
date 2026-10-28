@@ -238,6 +238,14 @@ test("resource descriptions derive language and mime without overriding host met
 	).toMatchObject({ mime: "application/custom", text: false });
 });
 
+test("justfiles describe as just by file name, dotfile name and extension", () => {
+	for (const path of ["justfile", "Justfile", ".justfile", "deploy.just", "recipes/justfile"]) {
+		expect(
+			describeResource("ws", path, { hash: "hash", byteLength: 10, text: true }),
+		).toMatchObject({ language: "just" });
+	}
+});
+
 test("placement uses anchor capabilities for the requested intent", () => {
 	const source = renderer("example/source", {
 		capabilities: {

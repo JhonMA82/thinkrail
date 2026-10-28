@@ -26,6 +26,12 @@ const LANGUAGE_BY_EXTENSION: Readonly<Record<string, string>> = {
 	yml: "yaml",
 	diff: "diff",
 	patch: "diff",
+	just: "just",
+};
+
+const LANGUAGE_BY_FILENAME: Readonly<Record<string, string>> = {
+	justfile: "just",
+	".justfile": "just",
 };
 
 const MIME_BY_EXTENSION: Readonly<Record<string, string>> = {
@@ -61,10 +67,20 @@ const MIME_BY_EXTENSION: Readonly<Record<string, string>> = {
 	pdf: "application/pdf",
 };
 
+function baseName(path: string): string {
+	return canonicalWorkspacePath(path).split("/").at(-1) ?? path;
+}
+
 function extension(path: string): string {
-	const name = canonicalWorkspacePath(path).split("/").at(-1) ?? path;
+	const name = baseName(path);
 	const dot = name.lastIndexOf(".");
 	return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
+}
+
+function inferredLanguage(path: string): string | undefined {
+	return (
+		LANGUAGE_BY_FILENAME[baseName(path).toLowerCase()] ?? LANGUAGE_BY_EXTENSION[extension(path)]
+	);
 }
 
 export function inferredMime(path: string): string | undefined {
@@ -77,14 +93,14 @@ export function describeResource(
 	meta: ResourceMeta,
 	scope?: GitDiffScope,
 ): ResourceDescriptor {
-	const ext = extension(path);
+	const language = inferredLanguage(path);
 	const mime = meta.mime ?? inferredMime(path);
 	return {
 		workspaceId,
 		path: canonicalWorkspacePath(path),
 		text: meta.text,
 		...(mime ? { mime } : {}),
-		...(meta.text && LANGUAGE_BY_EXTENSION[ext] ? { language: LANGUAGE_BY_EXTENSION[ext] } : {}),
+		...(meta.text && language ? { language } : {}),
 		...(meta.byteLength === null ? {} : { byteLength: meta.byteLength }),
 		...(scope ? { scope } : {}),
 	};

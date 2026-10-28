@@ -15,7 +15,8 @@ export function numArg(args: Record<string, unknown>, key: string): number | nul
 }
 
 export function languageFromPath(path: string): string {
-	const ext = path.split(".").at(-1)?.toLowerCase() ?? "";
+	const name = path.slice(path.lastIndexOf("/") + 1);
+	const ext = name.slice(name.lastIndexOf(".") + 1).toLowerCase();
 	const map: Record<string, string> = {
 		ts: "typescript",
 		tsx: "tsx",
@@ -33,6 +34,8 @@ export function languageFromPath(path: string): string {
 		md: "markdown",
 		yml: "yaml",
 		yaml: "yaml",
+		just: "just",
+		justfile: "just",
 	};
 	return map[ext] ?? "";
 }

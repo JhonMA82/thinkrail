@@ -202,7 +202,9 @@ keeps it.
 Own the engine-neutral resource description, renderer registry, and review-surface contract used by file
 and diff panes. Selection is metadata-driven: matching renderers are filtered by intent and phone support,
 ranked, and followed by the required text or byte fallback. MIME matching uses the same extension-derived
-fallback as resource description when host MIME metadata is absent. The resulting ordered list is both
+fallback as resource description when host MIME metadata is absent. Resource description derives the
+language it reports the same way, by extension or by a well-known file name (`justfile`): the code renderer
+hands that id to Pierre as the diff's `lang`, and Pierre only infers a language from a path it recognizes. The resulting ordered list is both
 dispatch policy and the pane's view-toggle grammar. Renderer capabilities also state whether the selected
 surface supports copying its modified source, split/unified layout, and ignore-whitespace recomputation; the
 pane exposes only those applicable controls. `preload` marks a view worth loading before its first mount
@@ -637,7 +639,7 @@ content's own height.
   addition/deletion paint to feedback roles, so a theme swap needs no re-highlight. `TerminalInstance`
   similarly rebuilds from the complete 16-slot ANSI variable set. Monaco and xterm consume the nullable
   editor selection-foreground override when provided.
-- **Monaco loads one grammar per language and tokenizes on Oniguruma WASM.** Compiling all 35 catalog
+- **Monaco loads one grammar per language and tokenizes on Oniguruma WASM.** Compiling all 36 catalog
   grammars up front was a 210-250 ms main-thread task (about 870 ms at 4x CPU) before the first coloured
   line, and the JS regex engine tokenized about 4.5x slower than Oniguruma (a 2,861-line TS file: about
   1,715 ms against 380 ms). The factory's `create()` loads the grammar when Monaco first meets a model of

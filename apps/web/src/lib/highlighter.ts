@@ -183,6 +183,14 @@ export const SHIKI_FILE_LANGUAGES: readonly ShikiFileLanguage[] = [
 		load: () => import("@shikijs/langs/dockerfile"),
 	},
 	{
+		id: "just",
+		extensions: [".just", ".justfile"],
+		aliases: ["Just", "justfile"],
+		filenames: ["justfile"],
+		chat: true,
+		load: () => import("@shikijs/langs/just"),
+	},
+	{
 		id: "ini",
 		extensions: [".ini", ".properties", ".gitconfig", ".editorconfig"],
 		aliases: ["INI", "properties"],

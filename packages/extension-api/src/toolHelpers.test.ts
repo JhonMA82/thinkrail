@@ -65,3 +65,12 @@ test("languageFromPath maps known extensions and falls back to ''", () => {
 	expect(languageFromPath("notes.unknown")).toBe("");
 	expect(languageFromPath("Makefile")).toBe("");
 });
+
+test("languageFromPath reads a justfile by name or extension, in any directory", () => {
+	expect(languageFromPath("justfile")).toBe("just");
+	expect(languageFromPath("Justfile")).toBe("just");
+	expect(languageFromPath(".justfile")).toBe("just");
+	expect(languageFromPath("deploy.just")).toBe("just");
+	expect(languageFromPath("recipes/justfile")).toBe("just");
+	expect(languageFromPath("v1.2/justfile")).toBe("just");
+});
