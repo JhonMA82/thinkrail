@@ -35,7 +35,7 @@ The sibling dependency graph is: `layoutState → layout`; `chatReconciliation �
 
 ## Composition
 
-The topbar keeps ThinkRail identity, connection state, Settings, and compact location context, and doubles
+The topbar keeps ThinkRail identity, connection state, quick layout save, Settings, and compact location context, and doubles
 as the **window title bar** when a native host removes its own strip ([[module-desktop]], *Native window
 chrome*). It is a fixed `h-topbar-row` (`--topbar-row-height`, 40px — macOS title-bar proportions, so
 native traffic lights sit centred in it) with `px-16`, and it is host-agnostic: the only host-shaped input
@@ -48,7 +48,7 @@ fullscreen. `--window-chrome-drag-region` drives the header's `window-drag` util
 drag strip. Padding was deliberately not used for the inset: the `spacingUsage` gate lets padding utilities
 name only canonical steps, and a CSS `padding-left: max(…)` would need a gate exemption. The header is
 `select-none`; its whole trailing action cluster (`topbar-actions`) is `window-no-drag`, so any button
-placed inside it — the Update affordance, quota Retry, Settings — is excluded from dragging by
+placed inside it — the Update affordance, quota Retry, layout Save, Settings — is excluded from dragging by
 construction; `Shell.tsx` itself places no other button in the header (`topbarChrome.test.ts` gates this).
 The location strip ([[submodule-web-shell-location-bar]]) is the one deliberate exception: its pills,
 chips, and Remote / Pull request split buttons each carry `window-no-drag` while their captions and hairlines stay draggable, so a user can still

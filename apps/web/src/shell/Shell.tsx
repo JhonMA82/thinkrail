@@ -33,6 +33,7 @@ import { AppShortcuts } from "./AppShortcuts";
 import { BrandLogo } from "./BrandLogo";
 import { JbcentralQuotaTopbar } from "./JbcentralQuotaTopbar";
 import { LayoutSettings } from "./LayoutSettings";
+import { SaveLayoutButton } from "./SaveLayoutButton";
 import { useLocalLayoutState } from "./layoutState";
 import { LocationBar } from "./locationBar";
 import { NativeWindowControls } from "./NativeWindowControls";
@@ -186,6 +187,7 @@ export function Shell() {
 							{t(STATUS_LABEL[status])}
 						</span>
 					</span>
+					<SaveLayoutButton />
 					<IconTooltip
 						label={
 							settingsShortcut
