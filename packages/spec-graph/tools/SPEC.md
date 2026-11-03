@@ -21,9 +21,9 @@ None edit prose.
   `spec_create` scaffold headings (`shared.ts`).
 - **Public surface:** the `index.ts` **barrel** exporting `registerSpecTools(pi)`; the extension entry
   (`../index.ts`) is the only caller.
-- **Allowed deps:** `core/` (via its barrel), `@earendil-works/pi-coding-agent` (types + `registerTool`),
-  `@earendil-works/pi-ai` (`StringEnum`, from the package root), `typebox`, Node built-ins
-  (`node:fs`/`node:path`, write tools only).
+- **Allowed deps:** `core/` (via its barrel), `@earendil-works/pi-coding-agent` (types and public
+  truncation helpers), `typebox`, Node built-ins. Project writes remain confined to write tools; any tool may capture oversized responses
+  in private OS temporary files, never in the project.
 - **Forbidden:** reaching into `core/` leaf files (import only the barrel); any `@thinkrail/*` package.
 
 ## Leaves
@@ -35,6 +35,13 @@ file; the other four are read-only.
 
 ## Invariants
 
+- Model-facing text, notices included, stays within Pi's 2,000-line / 50 KiB limits. Overflow is
+  captured in a private temporary file, which may expire; capture failure is explicit and never fails
+  a completed mutation. Tool errors set `isError: true` and retain a visible error marker even if
+  capture fails. Structured `details` remain presentation data, outside model context.
+- `spec_grep` pages by zero-based match offset with both a count and formatted-byte ceiling. Follow
+  `nextOffset` with the same filters; offset reads the current sorted sources, not a snapshot, so
+  restart when files change. One oversized match is file-backed rather than skipped or split.
 - Tools never edit prose; `spec_update` is frontmatter-only and never un-specs a file — it won't remove or
   blank `id`/`type`, and won't rename `id`. It sets/removes scalar fields and adds/removes entries across
   every list field (`depends-on`/`references`/`implements` + `covers`/`tags`) via `addList`/`removeList`;
@@ -42,7 +49,9 @@ file; the other four are read-only.
   place by `core`'s `updateFrontmatterText`, so comments, nested/unknown fields, field order, and the
   file's line endings are preserved.
 - Frontmatter field keys the tools read/write come from `core`'s `FIELDS` registry, and params over a
-  finite vocabulary use `StringEnum` seeded by the `core/` tuple (`spec_create.type` ← `SPEC_TYPES`,
+  finite vocabulary use `shared.ts`'s `stringEnum` (a TypeBox `Type.Unsafe` over
+  `{ type: "string", enum }`, the shape every provider accepts, unlike `Type.Union` of literals; pi-ai's
+  `StringEnum` is pi-schema-typed since pi 1.5) seeded by the `core/` tuple (`spec_create.type` ← `SPEC_TYPES`,
   `spec_create.status` ← `SPEC_STATUSES`, `spec_graph.direction` ← `SLICE_DIRECTIONS`,
   `spec_graph.edge` ← `LINK_KINDS`) — never re-typed literals, so a `core` rename flows here with no edit
   (pinned by `tools/tools.test.ts`).

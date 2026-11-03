@@ -1,5 +1,6 @@
 import { mkdirSync } from "node:fs";
 import type {
+	Ack,
 	OpenBranchReview,
 	ReviewComment,
 	ReviewFixDetails,
@@ -22,7 +23,6 @@ import {
 	abortSession,
 	acknowledgeCompletion,
 	admissionContextFor,
-	answerQuestion,
 	applyPiResourceTrust,
 	cancelMcpProbe,
 	clampThinkingForModel,
@@ -30,8 +30,10 @@ import {
 	compactSession,
 	createSession,
 	deleteSession,
+	disableAnthropicExtraUsageWarning,
 	ensureSessionAttached,
 	followUpSession,
+	getResourceHistoryPage,
 	getSessionCommands,
 	getSessionMessages,
 	getSessionResources,
@@ -42,6 +44,7 @@ import {
 	isMcpLoginId,
 	isPiSessionId,
 	listAvailableModels,
+	listCustomEndpoints,
 	listModelContextSettings,
 	listProjectAliasSkillNames,
 	listSessionStates,
@@ -52,6 +55,7 @@ import {
 	markWorkspaceUnread,
 	notifyExtUi,
 	nudgeSession,
+	probeCustomEndpoint,
 	projectTrustSummary,
 	promptSession,
 	readBackgroundCommandOutput,
@@ -60,12 +64,15 @@ import {
 	refreshSubagentConcurrency,
 	refreshSubagentTools,
 	reloadSessionResources,
+	removeCustomEndpoint,
 	removeQueuedSession,
 	removeSession,
 	removeWorkspaceSessions,
 	renameSession,
 	replyMcpProbe,
 	resolveExtUi,
+	respondToTool,
+	saveCustomEndpoint,
 	sendReviewFixToSession,
 	setModelContextWindow,
 	setSessionModel,
@@ -77,6 +84,8 @@ import {
 } from "../agent";
 import {
 	type AdditionalAnalyticsCapture,
+	captureSurveyResponse,
+	type ErrorReport,
 	reportClientError,
 	type SendMode,
 	track,
@@ -85,6 +94,7 @@ import { suggestPrDescription } from "../assist";
 import {
 	cancelLogin,
 	connectJbcentral,
+	detectAccounts,
 	disconnectJbcentral,
 	getJbcentralQuota,
 	getProviderStatus,
@@ -101,7 +111,19 @@ import { selectDirectory } from "../dialog";
 import { listAvailableEditors, openEditor, revealInFileManager } from "../editors";
 import { hostEnvironmentStatus, updateHostEnvironment } from "../environment";
 import { listExtensionCatalog } from "../extensions";
-import { recordAcceptedMessage, respondToInterview } from "../feedback";
+import {
+	completeSurvey,
+	confirmInAppSurvey,
+	currentInAppSurvey,
+	localizeSurvey,
+	parseSurveySubmission,
+	recordAcceptedMessage,
+	refreshInAppSurvey,
+	respondToInvitation,
+	surveyIsCompleted,
+	surveyResponse,
+} from "../feedback";
+import { fontsDir, listInstalledFonts, readUserFonts } from "../fonts";
 import { readDir, readFile } from "../fs";
 import {
 	commitsAheadOf,
@@ -134,8 +156,11 @@ import {
 } from "../pr";
 import {
 	acknowledgeProjectSkills,
+	cancelProjectClone,
 	closeProject,
+	createProject,
 	initProject,
+	inspectCloneDestination,
 	inspectProjectPath,
 	listProjects,
 	openProject,
@@ -143,6 +168,7 @@ import {
 	setProjectGroupEnabled,
 	setProjectSkillEnabled,
 	setProjectTrust,
+	startProjectClone,
 } from "../projects";
 import {
 	addComment,
@@ -179,6 +205,7 @@ import {
 	resizeTerminal,
 	writeTerminal,
 } from "../terminal";
+import { readUserThemes, themesDir } from "../themes";
 import {
 	addTodo,
 	approveTodoReview,
@@ -242,6 +269,15 @@ import {
 	mcpUpdate,
 } from "./mcp";
 import { resolveNewChatModel } from "./newChatModel";
+import {
+	packagesCheckUpdates,
+	packagesInstall,
+	packagesList,
+	packagesRemove,
+	packagesReveal,
+	packagesSetResourceEnabled,
+	packagesUpdate,
+} from "./packages";
 import { planReviewRunning } from "./planReviewQueue";
 import {
 	additionalCapture,
@@ -314,6 +350,12 @@ async function sendUserMessage(
 		recordAcceptedMessage(clientKey);
 	}
 	return { ok: true };
+}
+
+function revealDataFolder(dir: string) {
+	mkdirSync(dir, { recursive: true });
+	revealInFileManager(dir);
+	return { ok: true } as const;
 }
 
 function resolveTemplateReadDirs(params: TemplateReadLocation) {
@@ -479,10 +521,70 @@ function resourceParams<K extends string>(params: unknown, keys: K[]): Record<K,
 	return result;
 }
 
+function resourceHistoryParams(params: unknown): WsParams<"session.resourceHistory"> {
+	if (!params || typeof params !== "object" || Array.isArray(params))
+		throw new Error("Invalid resource history request");
+	const { kind, before, limit, ...scope } = params as Record<string, unknown>;
+	const { workspaceId, sessionId } = resourceParams(scope, ["workspaceId", "sessionId"]);
+	if (kind !== "command" && kind !== "subagent") throw new Error("Invalid resource history kind");
+	if (limit !== undefined && (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1))
+		throw new Error("Invalid resource history limit");
+	const request: WsParams<"session.resourceHistory"> = {
+		workspaceId,
+		sessionId,
+		kind,
+		...(limit === undefined ? {} : { limit }),
+	};
+	if (before === undefined) return request;
+	if (!before || typeof before !== "object" || Array.isArray(before))
+		throw new Error("Invalid resource history cursor");
+	const { at, id, ...extra } = before as Record<string, unknown>;
+	if (
+		Object.keys(extra).length > 0 ||
+		typeof at !== "number" ||
+		!Number.isFinite(at) ||
+		typeof id !== "string" ||
+		!(kind === "subagent" ? isPiSessionId(id) : isHostResourceId(id))
+	)
+		throw new Error("Invalid resource history cursor");
+	return { ...request, before: { at, id } };
+}
+
+async function deliverToolResponse(
+	sessionId: string,
+	toolCallId: string,
+	response: unknown,
+): Promise<Ack> {
+	if (!hasSession(sessionId)) throw new Error(`Unknown session: ${sessionId}`);
+	if (response === undefined) throw new Error("A tool response must carry a value");
+	await ackSend(respondToTool(sessionId, toolCallId, response));
+	return { ok: true };
+}
+
+function invalidSurveyOnThrow<T>(build: () => T): T {
+	try {
+		return build();
+	} catch {
+		throw new CodedError("SURVEY_INVALID", "Invalid survey submission");
+	}
+}
+
 const handlers: WsHandlers = {
 	"project.open": (params) => observeSetupAction("project_open", () => openProject(params.path)),
 	"project.inspect": (params) => inspectProjectPath(params.path),
 	"project.init": (params) => observeSetupAction("project_init", () => initProject(params.path)),
+	"project.create": (params) =>
+		observeSetupAction("project_create", () =>
+			createProject(params.parentPath, params.name, params.displayName),
+		),
+	"project.cloneDestination": (params) => ({
+		path: inspectCloneDestination(params.parentPath, params.name),
+	}),
+	"project.clone": (params, ctx) => startProjectClone(params, ctx.clientKey),
+	"project.cancelClone": (params, ctx) => {
+		cancelProjectClone(params.operationId, ctx.clientKey);
+		return { ok: true };
+	},
 	"project.list": () =>
 		observeSetupRead(listProjects, (projects) => ({
 			project_present: projects.length > 0 ? "yes" : "no",
@@ -887,13 +989,20 @@ const handlers: WsHandlers = {
 		return listSkillCatalog(ws.worktreePath, admissionContextFor(project, ws.skillOverrides ?? {}));
 	},
 	"extension.list": () => listExtensionCatalog(new Set(getConfig().disabledExtensions)),
+	"packages.list": (p) => packagesList(p),
+	"packages.install": (p) => packagesInstall(p),
+	"packages.remove": (p) => packagesRemove(p),
+	"packages.update": (p) => packagesUpdate(p),
+	"packages.checkUpdates": (p) => packagesCheckUpdates(p),
+	"packages.setResourceEnabled": (p) => packagesSetResourceEnabled(p),
+	"packages.reveal": (p) => packagesReveal(p),
 	"locales.list": () => readLocalLocales(),
-	"locales.reveal": () => {
-		const dir = localesDir();
-		mkdirSync(dir, { recursive: true });
-		revealInFileManager(dir);
-		return { ok: true } as const;
-	},
+	"locales.reveal": () => revealDataFolder(localesDir()),
+	"themes.list": () => readUserThemes(),
+	"themes.reveal": () => revealDataFolder(themesDir()),
+	"fonts.list": () => readUserFonts(),
+	"fonts.installed": () => listInstalledFonts(),
+	"fonts.reveal": () => revealDataFolder(fontsDir()),
 	"project.acknowledgeSkills": (p) => {
 		return acknowledgeProjectSkills(p.id, p.names);
 	},
@@ -1091,6 +1200,10 @@ const handlers: WsHandlers = {
 		const p = resourceParams(params, ["workspaceId", "sessionId"]);
 		return getSessionResources(p.workspaceId, p.sessionId, resourceCwd(p.workspaceId));
 	},
+	"session.resourceHistory": (params) => {
+		const { workspaceId, sessionId, ...request } = resourceHistoryParams(params);
+		return getResourceHistoryPage(workspaceId, sessionId, resourceCwd(workspaceId), request);
+	},
 	"backgroundCommand.output": (params) => {
 		const p = resourceParams(params, ["workspaceId", "sessionId", "commandId"]);
 		return readBackgroundCommandOutput(
@@ -1137,13 +1250,8 @@ const handlers: WsHandlers = {
 		resolveExtUi(params.response);
 		return { ok: true } as const;
 	},
-	"session.answerQuestion": async (p) => {
-		if (!hasSession(p.sessionId)) throw new Error(`Unknown session: ${p.sessionId}`);
-		if (!p.result || !Array.isArray(p.result.answers) || typeof p.result.cancelled !== "boolean")
-			throw new Error("Malformed ask_user_question result");
-		await ackSend(answerQuestion(p.sessionId, p.toolCallId, p.result));
-		return { ok: true } as const;
-	},
+	"session.respondToTool": (p) => deliverToolResponse(p.sessionId, p.toolCallId, p.response),
+	"session.answerQuestion": (p) => deliverToolResponse(p.sessionId, p.toolCallId, p.result),
 	"model.list": () =>
 		observeSetupRead(listAvailableModels, (models) => ({
 			model_available: models.length > 0 ? "yes" : "no",
@@ -1163,6 +1271,10 @@ const handlers: WsHandlers = {
 	"model.setContextWindow": (p) => {
 		return setModelContextWindow(p.target, p.contextWindow);
 	},
+	"customEndpoints.list": () => listCustomEndpoints(),
+	"customEndpoints.probe": (p) => probeCustomEndpoint(p),
+	"customEndpoints.save": (p) => saveCustomEndpoint(p),
+	"customEndpoints.remove": (p) => removeCustomEndpoint(p.id),
 	"model.default": () =>
 		observeSetupRead(
 			() => resolveNewChatModel({}),
@@ -1172,10 +1284,11 @@ const handlers: WsHandlers = {
 		observeSetupRead(getProviderStatus, (report) => ({
 			provider_available: providerAvailability(report),
 		})),
+	"provider.detect": async () => ({ accounts: await detectAccounts() }),
 	"provider.loginStart": (p) => {
 		const type = p.type ?? "oauth";
 		const capture = additionalCapture();
-		const handle = startLogin(p.providerId, type);
+		const handle = startLogin(p.providerId, type, dropLogin);
 		recordLoginStart(handle.loginId, type, capture);
 		return handle;
 	},
@@ -1196,6 +1309,10 @@ const handlers: WsHandlers = {
 	},
 	"provider.logout": async (params) => {
 		await logoutProvider(params.providerId);
+		return { ok: true } as const;
+	},
+	"provider.disableWarning": async () => {
+		await disableAnthropicExtraUsageWarning();
 		return { ok: true } as const;
 	},
 	"provider.jbcentralConnect": () =>
@@ -1224,7 +1341,43 @@ const handlers: WsHandlers = {
 	"environment.get": () => hostEnvironmentStatus(),
 	"environment.update": (params) => updateHostEnvironment(params.environment),
 	"feedback.respond": (params) => {
-		respondToInterview(params.action);
+		respondToInvitation(params.action);
+		return { ok: true } as const;
+	},
+	"feedback.survey": async (params) => {
+		await refreshInAppSurvey();
+		const survey = currentInAppSurvey();
+		if (!survey || surveyIsCompleted(survey.id, survey.iteration)) return { survey: null };
+		const language =
+			typeof params?.language === "string" && params.language.length <= 35
+				? params.language
+				: undefined;
+		return { survey: localizeSurvey(survey, language) };
+	},
+	"feedback.survey.submit": async (params) => {
+		const submission = invalidSurveyOnThrow(() => parseSurveySubmission(params));
+		const survey = await confirmInAppSurvey().catch(() => {
+			throw new CodedError("SURVEY_NOT_SENT", "Survey could not be confirmed");
+		});
+		if (!survey || surveyIsCompleted(survey.id, survey.iteration)) {
+			throw new CodedError("SURVEY_UNAVAILABLE", "Survey is unavailable");
+		}
+		if (
+			survey.id !== submission.surveyId ||
+			survey.iteration !== submission.iteration ||
+			localizeSurvey(survey, submission.language).language !== submission.language
+		) {
+			throw new CodedError("SURVEY_CHANGED", "Survey changed");
+		}
+		const properties = invalidSurveyOnThrow(() => surveyResponse(survey, submission));
+		if (!captureSurveyResponse(properties)) {
+			throw new CodedError("SURVEY_NOT_SENT", "Survey answers were not sent");
+		}
+		try {
+			completeSurvey(survey.id, survey.iteration);
+		} catch (error) {
+			log.warn("survey completion was not persisted", error);
+		}
 		return { ok: true } as const;
 	},
 	"client.reportError": (params) => {
@@ -1350,6 +1503,14 @@ function dispatch<M extends WsMethodName>(method: M, params: WsParams<M>, ctx: R
 
 export function requestMethodDiagnostic(method: string): string {
 	return isWsMethod(method) ? method : "unknown method";
+}
+
+export function requestErrorReport(method: string): ErrorReport {
+	return {
+		source: "request",
+		handled: true,
+		...(isWsMethod(method) ? { requestMethod: method } : {}),
+	};
 }
 
 function supportsBranchStatus(protocolVersion: number | undefined): boolean {

@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
@@ -21,6 +21,7 @@ import {
 import backgroundCommandsExtension, {
 	BACKGROUND_COMMAND_COMPLETION_MESSAGE,
 	type BackgroundCommandContext,
+	type BackgroundCommands,
 	createBackgroundCommands,
 	createBackgroundCommandsExtension,
 } from "../index";
@@ -447,34 +448,41 @@ test("a detached command survives the parent-turn signal and reports after paren
 
 test("standalone shutdown kills owned process trees silently", async () => {
 	const session = await makeSession();
-	const escaped = join(cwd, "must-not-finish");
-	const ready = join(cwd, "process-ready");
-	const leakAfterMs = 3000;
+	const heartbeat = join(cwd, "descendant-heartbeat");
+	const beats = () => (existsSync(heartbeat) ? statSync(heartbeat).size : 0);
 	try {
 		faux.setResponses([
 			fauxAssistantMessage(
 				fauxToolCall("background_command", {
 					action: "start",
-					command: `sh -c 'printf ready > "${ready}"; sleep ${leakAfterMs / 1000}; printf leaked > "${escaped}"'`,
+					command: `sh -c '(while :; do printf . >> "${heartbeat}"; sleep 0.1; done) & wait'`,
 				}),
 			),
 			fauxAssistantMessage("ACK"),
 			fauxAssistantMessage("MUST_NOT_WAKE"),
 		]);
 		await session.prompt("Start until shutdown.");
-		await waitFor(() => existsSync(ready));
-		const readyAt = Date.now();
+		await waitFor(() => beats() > 0, 5000);
 		const calls = faux.state.callCount;
 		await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
-		await Bun.sleep(Math.max(500, readyAt + leakAfterMs + 500 - Date.now()));
+		const deadline = Date.now() + 10_000;
+		let seen = beats();
+		let quietSince = Date.now();
+		while (Date.now() - quietSince < 1500) {
+			if (Date.now() > deadline) throw new Error("Descendant outlived session shutdown");
+			await Bun.sleep(50);
+			if (beats() !== seen) {
+				seen = beats();
+				quietSince = Date.now();
+			}
+		}
 		expect(faux.state.callCount).toBe(calls);
-		expect(existsSync(escaped)).toBe(false);
 		expect(JSON.stringify(session.messages)).not.toContain(BACKGROUND_COMMAND_COMPLETION_MESSAGE);
 	} finally {
 		await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
 		session.dispose();
 	}
-}, 15_000);
+}, 20_000);
 
 test("deletion tombstones defer bounded completion messages until rollback, without a resource reload", async () => {
 	const executor = controlledOperations();
@@ -616,6 +624,24 @@ async function injected(canDeliverCompletion?: () => boolean) {
 	return { executor, service, session, finish, close };
 }
 
+async function waitForListed(session: Session, status: string): Promise<void> {
+	const tool = session.getToolDefinition("background_command");
+	if (!tool) throw new Error("Missing background_command");
+	const deadline = Date.now() + 10_000;
+	for (;;) {
+		const listed = await tool.execute(
+			"probe",
+			{ action: "list" },
+			undefined,
+			undefined,
+			session.extensionRunner.createToolContext("probe", undefined),
+		);
+		if (JSON.stringify(listed.content).includes(`: ${status}`)) return;
+		if (Date.now() > deadline) throw new Error(`No command reached ${status}`);
+		await Bun.sleep(20);
+	}
+}
+
 function startCommand(command: string) {
 	return fauxAssistantMessage(fauxToolCall("background_command", { action: "start", command }));
 }
@@ -729,6 +755,94 @@ test("commands released to an idle parent together wake exactly one run", async 
 		expect(JSON.stringify(session.messages)).not.toContain("SECOND_WAKE");
 	} finally {
 		await close();
+	}
+});
+
+function nextChange(service: BackgroundCommands): Promise<void> {
+	return new Promise((resolve) => {
+		const off = service.onChange(() => {
+			off();
+			resolve();
+		});
+	});
+}
+
+test("a command finishing before the post-settle flush wakes the idle parent in the same tick", async () => {
+	const { executor, service, session, close } = await injected();
+	const counter = countSettles(session);
+	let sawReport = false;
+	try {
+		faux.setResponses([
+			startCommand("work"),
+			fauxAssistantMessage("STARTED"),
+			(context) => {
+				sawReport = JSON.stringify(context.messages).includes("CMD_DONE");
+				return fauxAssistantMessage("WOKEN");
+			},
+		]);
+		await session.prompt("Start.");
+		const finished = nextChange(service);
+		executor.call(0).options.onData?.(Buffer.from("CMD_DONE"));
+		executor.call(0).resolve({ exitCode: 0 });
+		await finished;
+		expect(session.isStreaming).toBe(true);
+		await waitFor(() => !session.isStreaming && counter.settles === 2);
+		await macrotask();
+		expect(sawReport).toBe(true);
+		expect(counter.settles).toBe(2);
+		expect(commandDeliveries(session)).toEqual(["wake"]);
+	} finally {
+		await close();
+	}
+});
+
+test("commands finishing while Pi settles the idle parent wake it only once", async () => {
+	const executor = controlledOperations();
+	const sm = SessionManager.inMemory(cwd);
+	const service = createBackgroundCommands(
+		{ sessionId: sm.getSessionId(), getContext: () => ({ cwd }) },
+		executor,
+	);
+	let finishWhileSettling = true;
+	const session = await makeSession((pi) => {
+		pi.on("agent_settled", async () => {
+			if (!finishWhileSettling) return;
+			finishWhileSettling = false;
+			for (const [index, text] of ["FIRST_CMD", "SECOND_CMD"].entries()) {
+				const finished = nextChange(service);
+				executor.call(index).options.onData?.(Buffer.from(text));
+				executor.call(index).resolve({ exitCode: 0 });
+				await finished;
+			}
+		});
+		return createBackgroundCommandsExtension({ service })(pi);
+	}, sm);
+	const counter = countSettles(session);
+	let reports = 0;
+	try {
+		faux.setResponses([
+			fauxAssistantMessage([
+				fauxToolCall("background_command", { action: "start", command: "one" }),
+				fauxToolCall("background_command", { action: "start", command: "two" }),
+			]),
+			fauxAssistantMessage("STARTED"),
+			fauxAssistantMessage("WOKEN"),
+			(context) => {
+				const text = JSON.stringify(context.messages);
+				reports = ["FIRST_CMD", "SECOND_CMD"].filter((r) => text.includes(r)).length;
+				return fauxAssistantMessage("REACTED");
+			},
+		]);
+		await session.prompt("Start two.");
+		await waitFor(() => !session.isStreaming && commandDeliveries(session).length === 2);
+		await macrotask();
+		expect(counter.settles).toBe(2);
+		expect(commandDeliveries(session)).toEqual(["wake", "run"]);
+		expect(reports).toBe(2);
+	} finally {
+		await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+		await service.dispose();
+		session.dispose();
 	}
 });
 
@@ -881,7 +995,7 @@ test("one factory serving two sessions keeps each session's Stop to itself", asy
 		faux.setResponses([
 			startCommand("printf HELD_IN_FIRST"),
 			async (_context, options) => {
-				await Bun.sleep(300);
+				await waitForListed(first, "completed");
 				parked();
 				await new Promise((resolve) =>
 					options?.signal?.addEventListener("abort", resolve, { once: true }),
@@ -917,4 +1031,4 @@ test("one factory serving two sessions keeps each session's Stop to itself", asy
 		first.dispose();
 		second.dispose();
 	}
-});
+}, 20_000);

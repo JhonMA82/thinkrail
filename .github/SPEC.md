@@ -35,8 +35,9 @@ PR and merge-queue gates cover dependency/boundary/seam/spec-surface conformance
 no-agent browser tests. Linux and Windows run native CLI artifact smoke; Linux also runs browser tests
 against the compiled binary. Desktop coverage builds the Linux target, runs native-window and shared
 artifact probes under Xvfb with test-only software-rendering flags, and runs desktop-backed browser tests.
-The Linux binary and desktop suites run on every merge group but on a PR only when its change can affect
-artifacts (change classifier below). Real-provider tests remain explicitly authorized and separate.
+Windows also builds the desktop app and runs its native smoke, without browser tests (below).
+The Linux binary and desktop suites and the Windows desktop smoke run on every merge group but on a PR
+only when its change can affect artifacts (change classifier below). Real-provider tests remain explicitly authorized and separate.
 
 The three browser suites dominate wall time, so each runs as a matrix of Playwright shards on separate
 runners ([[module-browser-e2e]] owns the slicing). Shard counts trade runner minutes for wall time and are
@@ -51,23 +52,25 @@ six-hour default.
 
 **Change classifier.** A `changes` job diffs the PR or merge group against its base, counting a rename as
 both its old and new path. When every changed path lies outside the app — the website and its analytics
-package, the website workflows, README screenshots — the classifier skips the pi-package, browser, binary,
+package, the website workflows, README and PR screenshots, the root README, CONTRIBUTING, CODE_OF_CONDUCT
+and LICENSE, and GitHub's issue/PR templates, CODEOWNERS and this spec — the classifier skips the pi-package, browser, binary,
 Windows and desktop jobs; any other path, or a failed diff, runs them all. The exclusion list is a path
 allow-list, never a file-type rule: Markdown is product input here (skills ship in the artifacts, specs feed
 conformance gates). In the merge queue it diffs against the target branch, not the event's `base_sha`: that
 is the previous entry's group head, and with HEADGREEN grouping a green head merges every entry ahead, so a
 site PR queued behind an app PR must still run the full set. Conformance, lint/typecheck and unit tests
 always run; they are cheap and cover the website too. A second output, `artifacts`, gates the Linux binary
-and desktop suites, which replay the no-agent browser suite against built artifacts and cost over half of
+and desktop suites and the Windows desktop smoke; the Linux suites replay the no-agent browser suite against built artifacts and cost over half of
 CI's runner time: on a PR they run only when a path feeds building or packaging — the CLI and desktop apps,
 artifact tests, shared's native icon set, its generator, release identity and Windows file identity, the
-server's build support and bundled-runtime registration, the artifact Playwright runners, CI definitions, patches and the root manifests and lockfile — and in a merge group they always run,
+server's build support and bundled-runtime registration, the artifact Playwright runners, CI workflows,
+actions and scripts, patches and the root manifests and lockfile — and in a merge group they always run,
 so main never lands an artifact they have not exercised. An artifact-only defect in an unrelated change
 therefore surfaces at enqueue time instead of on the PR; it was 1 in 56 failed runs before the split. That
 includes the shared no-agent specs and fixtures the artifact suites replay: only the artifact runners and
 configs are classifier paths, so a harness change that breaks only the binary or desktop replay is also
-caught at enqueue. The Windows job stays on every app PR: it is mostly native unit gates, not an artifact
-replay.
+caught at enqueue. The Windows unit-and-binary job stays on every app PR: it is mostly native unit gates,
+not an artifact replay.
 
 Browser jobs retry the Playwright browser download a bounded number of times, a network fault that otherwise
 ejects an entry from the merge queue; inside a job Playwright retries a failed test once on CI (source and
@@ -76,7 +79,16 @@ no job is re-run automatically. They install Chromium without `--with-deps`: the
 carries its shared libraries, and the extra apt packages (CJK/Thai/X fonts) feed no assertion while their
 Ubuntu-mirror download was the slowest step of the job, often for minutes. A missing library fails
 Chromium's launch loudly. The browsers themselves are not cached: the Playwright CDN download takes seconds,
-no slower than an Actions-cache restore of the same bytes.
+no slower than an Actions-cache restore of the same bytes. Jobs download only Chromium's headless shell,
+the one binary headless tests launch, and start it in the background right after `bun install`; a wait
+step joins it, failing with its status, just before the browser tests, so the download overlaps the build
+instead of preceding it.
+
+Jobs that typecheck or build the desktop app first download Electrobun's Hutch toolchain (Hutch, Cottontail,
+the Electrobun core and its Bun toolchain, all GitHub release assets) through
+`.github/scripts/prepare-electrobun.sh`, which retries `electrobun prepare` a bounded number of times;
+`electrobun build` and the typecheck's own `prepare` then find it in `~/.hutch`. Before that step, a dropped
+release download (`ReleaseDownloadFailed`, a timed-out Hutch index) failed whole desktop jobs, 6 in two weeks.
 
 Native artifact smokes run only in shard 1: repeating an identical probe per shard adds no coverage and
 multiplies exposure to runner-environment faults.
@@ -101,7 +113,10 @@ desktop window-chrome unit gate binds the `user32.dll` frame symbols the framele
 round-trips the window icon through a real window, and stamps an AppUserModelID onto real shortcuts
 ([[module-desktop]]). Neither gate needs the
 Electrobun devkit. Its binary smoke also checks the compiled exe's icon and file properties
-([[module-artifact-tests]]). Its path gate (`bun run test:windows-paths`) runs
+([[module-artifact-tests]]). A separate Windows desktop job builds the desktop app and runs the native
+desktop smoke, which checks the branded `bun.exe`, `launcher.exe` and uninstaller. Only a Windows build
+runs the desktop `postBuild` branding over Hutch's output ([[module-desktop]]). Before this job existed, a
+branding defect first failed in the nightly release build. Its path gate (`bun run test:windows-paths`) runs
 the suites that pin architecture Decision 22 on the one host where git prints `C:/…`, node prints `C:\…`,
 and `\` is not a file-name character: stored directories, chat lifecycle in Default and external workspaces,
 POSIX wire paths, git object names, picker roots, and `install.ps1`'s PATH check. A suite joins the gate only
@@ -113,7 +128,7 @@ install turns that into timeouts. Tests with an explicit timeout keep it. The ru
 name (`C:\Users\RUNNER~1\…`) while git reports the long one, so path fixtures are rooted at
 `realpathSync.native`, the spelling git and the OS agree on. The installer file contributes only its
 `install.ps1` suite, because its `install.sh` tests rightly reject the `~` such a prefix carries. Native
-macOS and Linux ARM64 acceptance belongs to the release matrix. The Windows job installs Bun and its
+macOS and Linux ARM64 acceptance belongs to the release matrix. The Windows jobs install Bun and their
 dependencies without the Actions cache: restoring it took longer than a fresh install, and with no Windows
 job on main every PR and merge group kept its own copy, about half of the repository's cache quota.
 
@@ -130,8 +145,10 @@ Its stable public outputs are:
 - `desktop-update-manifest-path` / `desktop-update-archive-path` — Electrobun's updater metadata and
   full application archive, both non-empty on every desktop target.
 
-The recipe stamps the shared version, builds and smokes the CLI, invokes the normal Electrobun dev and
-channel builds, runs expanded-app and first-install smoke, then collects exact target/channel outputs.
+The recipe stamps the shared version, builds and smokes the CLI, downloads the Electrobun toolchain through
+`prepare-electrobun.sh` (above), invokes the normal Electrobun dev and channel builds, runs expanded-app and
+first-install smoke, then collects exact target/channel outputs. Before that step joined the recipe, a
+dropped Cottontail download failed the linux-arm64 build of the 0.3.1 stable release.
 Update outputs preserve Electrobun's generated basenames and compressed bytes. The manifest is the exact
 `<stable|canary>-<macos|win|linux>-<arm64|x64>-update.json`. Its `artifact.file` is the archive basename:
 `stable-<platform>-ThinkRail[.app].tar.zst` for stable or
@@ -147,11 +164,23 @@ Supported desktop assets:
 
 | Target | Native runner | Published asset |
 | --- | --- | --- |
-| `bun-darwin-arm64` | `macos-14` | `thinkrail-desktop-darwin-arm64.dmg` |
+| `bun-darwin-arm64` | `macos-15` | `thinkrail-desktop-darwin-arm64.dmg` |
 | `bun-darwin-x64` | `macos-15-intel` | `thinkrail-desktop-darwin-x64.dmg` |
-| `bun-windows-x64` | `windows-latest` | `thinkrail-desktop-windows-x64.zip` |
+| `bun-windows-x64` | `windows-2022` | `thinkrail-desktop-windows-x64.zip` |
 | `bun-linux-x64` | `ubuntu-24.04` | `thinkrail-desktop-linux-x64.tar.gz` |
 | `bun-linux-arm64` | `ubuntu-24.04-arm` | `thinkrail-desktop-linux-arm64.tar.gz` |
+
+The private pipeline owns these runner baselines. **Intel runner watch:** `macos-15-intel` runs only the
+x64 build and the finalized-DMG install smoke. Stapling, DMG creation and signature checks for both
+architectures stay on arm64 `macos-15`, because `xcrun stapler` fails on the Intel image
+([runner-images#14924](https://github.com/actions/runner-images/issues/14924)). `macos-26-intel` is avoided
+because its `iconservicesagent` crash-loop hangs app-launch tests
+([#14751](https://github.com/actions/runner-images/issues/14751)); Electrobun keeps its own Intel desktop
+validation on `macos-15-intel` for the same reason. Also watch Intel GPU hangs
+([#14836](https://github.com/actions/runner-images/issues/14836)) and slow Intel runners
+([#13358](https://github.com/actions/runner-images/issues/13358)). GitHub calls `macos-15-intel` its last
+hosted x86_64 image, available until about August 2027; before then, choose between a self-hosted Intel
+runner and dropping the Intel builds. Re-check these issues whenever a macOS runner image changes.
 
 Linux aliases name untouched framework installers. The Windows ZIP contains its setup executable and
 adjacent payload; the private pipeline signs both and repacks the payload (see Signing). Linux's tarball

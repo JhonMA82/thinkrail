@@ -7,12 +7,14 @@ import {
 import type { HistoryScope, MessageHit, PromptHit } from "@thinkrail/contracts";
 import type { MessageKey } from "@thinkrail/locales";
 import { type Translator, useT } from "@thinkrail/locales/react";
+import { IconButton } from "@thinkrail/ui/button";
 import {
 	DropdownMenu,
 	DropdownMenuContent,
 	DropdownMenuItem,
 	DropdownMenuTrigger,
 } from "@thinkrail/ui/dropdown-menu";
+import { isImeComposing } from "@thinkrail/ui/keyboard";
 import { IconTooltip } from "@thinkrail/ui/tooltip";
 import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useNow } from "@/components/useNow";
@@ -146,6 +148,7 @@ function PromptRow({
 		<div
 			data-testid="history-item"
 			data-kind="prompt"
+			data-row={isSelected || undefined}
 			data-selected={isSelected}
 			className={`group flex w-full items-center gap-4 rounded-sm border-l-2 py-4 pl-8 pr-4 text-left tr-text-ui ${
 				isSelected
@@ -178,22 +181,18 @@ function PromptRow({
 					{SAVE_SHORTCUT_LABEL}
 				</span>
 			) : null}
-			<IconTooltip label={t("chat.history.saveTemplateTooltip", { shortcut: SAVE_SHORTCUT_LABEL })}>
-				<button
-					type="button"
-					data-testid="history-save-template"
-					aria-label={t("chat.history.saveTemplate")}
-					onClick={(e) => {
-						e.stopPropagation();
-						onSaveAsTemplate();
-					}}
-					className={`flex shrink-0 items-center justify-center rounded-sm p-4 text-text-muted opacity-0 transition hover:bg-container-elevated-bg hover:text-text-default group-hover:opacity-100 ${
-						isSelected ? "opacity-100" : ""
-					}`}
-				>
-					<Save className="size-14" />
-				</button>
-			</IconTooltip>
+			<IconButton
+				icon={Save}
+				size="s"
+				data-testid="history-save-template"
+				label={t("chat.history.saveTemplate")}
+				tooltip={t("chat.history.saveTemplateTooltip", { shortcut: SAVE_SHORTCUT_LABEL })}
+				onClick={(e) => {
+					e.stopPropagation();
+					onSaveAsTemplate();
+				}}
+				className={`shrink-0 opacity-0 group-hover:opacity-100 ${isSelected ? "opacity-100" : ""}`}
+			/>
 			{target ? (
 				<>
 					{isSelected ? (
@@ -204,22 +203,18 @@ function PromptRow({
 							⇧⏎
 						</span>
 					) : null}
-					<IconTooltip label={t("chat.history.jumpTooltip", { shortcut: "⇧⏎" })}>
-						<button
-							type="button"
-							data-testid="history-jump"
-							aria-label={t("chat.history.jump")}
-							onClick={(e) => {
-								e.stopPropagation();
-								onOpenMessage(target);
-							}}
-							className={`flex shrink-0 items-center justify-center rounded-sm p-4 text-text-muted opacity-0 transition hover:bg-container-elevated-bg hover:text-text-default group-hover:opacity-100 ${
-								isSelected ? "opacity-100" : ""
-							}`}
-						>
-							<CornerUpRight className="size-14" />
-						</button>
-					</IconTooltip>
+					<IconButton
+						icon={CornerUpRight}
+						size="s"
+						data-testid="history-jump"
+						label={t("chat.history.jump")}
+						tooltip={t("chat.history.jumpTooltip", { shortcut: "⇧⏎" })}
+						onClick={(e) => {
+							e.stopPropagation();
+							onOpenMessage(target);
+						}}
+						className={`shrink-0 opacity-0 group-hover:opacity-100 ${isSelected ? "opacity-100" : ""}`}
+					/>
 				</>
 			) : null}
 			<DeleteChatButton
@@ -252,6 +247,7 @@ function MessageRow({
 		<div
 			data-testid="history-item"
 			data-kind="message"
+			data-row={isSelected || undefined}
 			data-selected={isSelected}
 			className={`group flex w-full items-center gap-4 rounded-sm border-l-2 pr-4 tr-text-ui ${
 				isSelected
@@ -401,7 +397,7 @@ function HistoryPicker({
 	useEffect(() => {
 		if (scopeMenuOpen) return;
 		const onWindowKeyDown = (e: globalThis.KeyboardEvent) => {
-			if (e.key !== "Escape") return;
+			if (e.key !== "Escape" || isImeComposing(e)) return;
 			e.preventDefault();
 			e.stopPropagation();
 			onClose();
@@ -439,6 +435,7 @@ function HistoryPicker({
 	}, [selectedKey]);
 
 	const onKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+		if (isImeComposing(e.nativeEvent)) return;
 		if ((e.metaKey || e.ctrlKey) && e.code === "KeyS") {
 			e.preventDefault();
 			const item = resolveHistorySelection(stage, result, selected);

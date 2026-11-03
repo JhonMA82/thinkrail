@@ -16,37 +16,52 @@ import {
 	CHAT_RESOURCES_PROTOCOL_VERSION,
 	CLIENT_ERROR_REPORT_PROTOCOL_VERSION,
 	CONTEXT_WINDOW_SETTINGS_PROTOCOL_VERSION,
+	CUSTOM_ENDPOINT_ID_PREFIX,
+	CUSTOM_ENDPOINTS_PROTOCOL_VERSION,
 	completionDelivery,
 	customMessageText,
 	DEFAULT_MODEL_PROTOCOL_VERSION,
 	EXTENSION_CATALOG_PROTOCOL_VERSION,
+	FEEDBACK_SURVEY_PROTOCOL_VERSION,
+	FONTS_PROTOCOL_VERSION,
 	HOST_ENVIRONMENT_PROTOCOL_VERSION,
 	HOST_UPDATE_RUN_PROTOCOL_VERSION,
 	isBackgroundCommandCompletionMessage,
+	isCustomEndpointId,
 	isTodoReviewFixMessage,
+	isToolResponsePending,
 	JBCENTRAL_QUOTA_PROTOCOL_VERSION,
 	LOCALES_PROTOCOL_VERSION,
 	MCP_PROTOCOL_VERSION,
 	MCP_TOOL_GRANTS_PROTOCOL_VERSION,
 	MODEL_PICKER_PROTOCOL_VERSION,
 	normalizeSessionTitle,
+	ONBOARDING_PROTOCOL_VERSION,
+	PI_PACKAGES_PROTOCOL_VERSION,
 	PLAN_REVIEW_SUBAGENT_PROTOCOL_VERSION,
 	PLAN_SUMMARY_GENERATION_PROTOCOL_VERSION,
 	PROJECT_RENAME_PROTOCOL_VERSION,
 	PROJECT_TEMPLATE_PREVIEW_PROTOCOL_VERSION,
 	PROJECT_TRUST_PROTOCOL_VERSION,
 	PROTOCOL_VERSION,
+	PROVIDER_WARNINGS_PROTOCOL_VERSION,
+	RESOURCE_HISTORY_PROTOCOL_VERSION,
 	RESOURCE_META_PROTOCOL_VERSION,
 	REVIEW_ACTIONS_PROTOCOL_VERSION,
 	REVIEW_RICH_ANCHORS_PROTOCOL_VERSION,
+	readToolResponseMessage,
 	SESSION_RENAME_PROTOCOL_VERSION,
 	SESSION_STATE_PROTOCOL_VERSION,
 	SESSION_TITLE_MAX_LENGTH,
 	SUBAGENT_CONCURRENCY_PROTOCOL_VERSION,
 	SUBAGENT_SETTINGS_PROTOCOL_VERSION,
+	SURVEY_TRANSLATIONS_PROTOCOL_VERSION,
 	THEME_SYSTEM_PROTOCOL_VERSION,
 	TODO_REVIEW_FIX_CUSTOM_TYPE,
+	TOOL_RESPONSE_CUSTOM_TYPE,
+	TOOL_RESPONSE_PROTOCOL_VERSION,
 	TURN_CHANGES_PROTOCOL_VERSION,
+	USER_THEMES_PROTOCOL_VERSION,
 	WINDOWS_SHELL_SETTINGS_PROTOCOL_VERSION,
 	WORKSPACE_READ_STATE_PROTOCOL_VERSION,
 	WORKSPACE_SETTLE_PROTOCOL_VERSION,
@@ -218,8 +233,32 @@ test("local language files and the locale setting are pinned to v89", () => {
 	expect(WS_CHANNELS.localesChanged).toBe("locales.changed");
 });
 
+test("tool responses replace the ask-only answer method at v93", () => {
+	expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(TOOL_RESPONSE_PROTOCOL_VERSION);
+	expect(TOOL_RESPONSE_PROTOCOL_VERSION).toBe(93);
+	expect(WS_METHODS.sessionRespondToTool).toBe("session.respondToTool");
+	expect(WS_METHODS.sessionAnswerQuestion).toBe("session.answerQuestion");
+});
+
+test("user-selectable fonts are pinned to v102", () => {
+	expect(FONTS_PROTOCOL_VERSION).toBe(102);
+	expect(PROTOCOL_VERSION).toBe(102);
+	expect(WS_METHODS.fontsList).toBe("fonts.list");
+	expect(WS_METHODS.fontsInstalled).toBe("fonts.installed");
+	expect(WS_METHODS.fontsReveal).toBe("fonts.reveal");
+	expect(WS_CHANNELS.fontsChanged).toBe("fonts.changed");
+});
+
+test("user theme files are pinned to v92", () => {
+	expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(USER_THEMES_PROTOCOL_VERSION);
+	expect(USER_THEMES_PROTOCOL_VERSION).toBe(92);
+	expect(WS_METHODS.themesList).toBe("themes.list");
+	expect(WS_METHODS.themesReveal).toBe("themes.reveal");
+	expect(WS_CHANNELS.themesChanged).toBe("themes.changed");
+});
+
 test("the stored host environment is pinned to v91", () => {
-	expect(PROTOCOL_VERSION).toBe(91);
+	expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(HOST_ENVIRONMENT_PROTOCOL_VERSION);
 	expect(HOST_ENVIRONMENT_PROTOCOL_VERSION).toBe(91);
 	expect(WS_METHODS.environmentGet).toBe("environment.get");
 	expect(WS_METHODS.environmentUpdate).toBe("environment.update");
@@ -253,6 +292,41 @@ test("review details and the GitHub review actions are pinned to v88", () => {
 	expect(WS_METHODS.prMerge).toBe("pr.merge");
 	expect(WS_METHODS.prReopen).toBe("pr.reopen");
 	expect(WS_METHODS.workspaceDeleteRemoteBranch).toBe("workspace.deleteRemoteBranch");
+});
+
+test("pi package management and the package switch are pinned to v100", () => {
+	expect(PI_PACKAGES_PROTOCOL_VERSION).toBe(100);
+	expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(PI_PACKAGES_PROTOCOL_VERSION);
+	expect(WS_METHODS.packagesList).toBe("packages.list");
+	expect(WS_METHODS.packagesInstall).toBe("packages.install");
+	expect(WS_METHODS.packagesRemove).toBe("packages.remove");
+	expect(WS_METHODS.packagesUpdate).toBe("packages.update");
+	expect(WS_METHODS.packagesCheckUpdates).toBe("packages.checkUpdates");
+	expect(WS_METHODS.packagesSetResourceEnabled).toBe("packages.setResourceEnabled");
+	expect(WS_METHODS.packagesReveal).toBe("packages.reveal");
+	expect(WS_CHANNELS.packagesChanged).toBe("packages.changed");
+	expect(DEFAULT_CONFIG.disabledPackages).toEqual([]);
+});
+
+test("project create and the onboarding dismissal are pinned to v94", () => {
+	expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(ONBOARDING_PROTOCOL_VERSION);
+	expect(ONBOARDING_PROTOCOL_VERSION).toBe(94);
+	expect(WS_METHODS.projectCreate).toBe("project.create");
+	expect(WS_METHODS.providerDetect).toBe("provider.detect");
+	expect(DEFAULT_CONFIG.onboardingDismissed).toBe(false);
+});
+
+test("in-app surveys are pinned to v97", () => {
+	expect(FEEDBACK_SURVEY_PROTOCOL_VERSION).toBe(97);
+	expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(FEEDBACK_SURVEY_PROTOCOL_VERSION);
+	expect(WS_METHODS.feedbackSurvey).toBe("feedback.survey");
+	expect(WS_METHODS.feedbackSurveySubmit).toBe("feedback.survey.submit");
+});
+
+test("repository cloning and cancellation are registered", () => {
+	expect(WS_METHODS.projectClone).toBe("project.clone");
+	expect(WS_METHODS.projectCancelClone).toBe("project.cancelClone");
+	expect(WS_METHODS.projectCloneDestination).toBe("project.cloneDestination");
 });
 
 test("MCP server management, status and chat resources are pinned to v83", () => {
@@ -409,6 +483,12 @@ test("chat resources introduce scoped reads and cancellation, never browser comm
 	expect(Object.values(WS_METHODS)).not.toContain("backgroundCommand.start");
 });
 
+test("resource history pages a chat's finished records from v96", () => {
+	expect(RESOURCE_HISTORY_PROTOCOL_VERSION).toBe(96);
+	expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(RESOURCE_HISTORY_PROTOCOL_VERSION);
+	expect(WS_METHODS.sessionResourceHistory).toBe("session.resourceHistory");
+});
+
 describe("completionDelivery", () => {
 	test("reads the delivery marker and treats a missing or unknown value as absent", () => {
 		expect(completionDelivery({ delivery: "wake" })).toBe("wake");
@@ -417,4 +497,68 @@ describe("completionDelivery", () => {
 		expect(completionDelivery({})).toBeUndefined();
 		expect(completionDelivery({ delivery: "later" })).toBeUndefined();
 	});
+});
+
+describe("tool response guards", () => {
+	test("isToolResponsePending recognises the pending marker only", () => {
+		expect(isToolResponsePending({ kind: "ack" })).toBe(true);
+		expect(isToolResponsePending({ kind: "other" })).toBe(false);
+		expect(isToolResponsePending({ answers: [], cancelled: true })).toBe(false);
+		expect(isToolResponsePending(undefined)).toBe(false);
+		expect(isToolResponsePending("ack")).toBe(false);
+	});
+
+	test("readToolResponseMessage reads the tool-response custom message", () => {
+		const message = {
+			role: "custom",
+			customType: TOOL_RESPONSE_CUSTOM_TYPE,
+			details: { toolCallId: "tc", response: { picked: "A" } },
+		};
+		expect(readToolResponseMessage(message)).toEqual({
+			toolCallId: "tc",
+			response: { picked: "A" },
+		});
+		expect(readToolResponseMessage({ ...message, customType: "other" })).toBeNull();
+		expect(readToolResponseMessage({ ...message, details: { toolCallId: "tc" } })).toBeNull();
+		expect(readToolResponseMessage({ ...message, details: { response: {} } })).toBeNull();
+		expect(readToolResponseMessage({ ...message, role: "user" })).toBeNull();
+		expect(readToolResponseMessage(null)).toBeNull();
+	});
+
+	test("readToolResponseMessage still reads the legacy ask-user-answers shape", () => {
+		const result = { answers: [], cancelled: true };
+		expect(
+			readToolResponseMessage({
+				role: "custom",
+				customType: "ask-user-answers",
+				details: { toolCallId: "tc", result },
+			}),
+		).toEqual({ toolCallId: "tc", response: result });
+		expect(
+			readToolResponseMessage({
+				role: "custom",
+				customType: "ask-user-answers",
+				details: { toolCallId: "tc" },
+			}),
+		).toBeNull();
+	});
+});
+
+test("survey translations and separate Other text are pinned to v98", () => {
+	expect(SURVEY_TRANSLATIONS_PROTOCOL_VERSION).toBe(98);
+	expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(SURVEY_TRANSLATIONS_PROTOCOL_VERSION);
+});
+
+test("provider warnings are pinned to v99", () => {
+	expect(PROVIDER_WARNINGS_PROTOCOL_VERSION).toBe(99);
+	expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(PROVIDER_WARNINGS_PROTOCOL_VERSION);
+	expect(WS_METHODS.providerDisableWarning).toBe("provider.disableWarning");
+});
+
+test("custom endpoints are pinned to v101 and own only custom-* providers", () => {
+	expect(CUSTOM_ENDPOINTS_PROTOCOL_VERSION).toBe(101);
+	expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(CUSTOM_ENDPOINTS_PROTOCOL_VERSION);
+	expect(WS_METHODS.customEndpointsProbe).toBe("customEndpoints.probe");
+	expect(isCustomEndpointId(`${CUSTOM_ENDPOINT_ID_PREFIX}gateway`)).toBe(true);
+	expect(isCustomEndpointId("ollama")).toBe(false);
 });

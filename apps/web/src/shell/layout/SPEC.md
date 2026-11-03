@@ -106,17 +106,22 @@ the plain pane header, and its Hide control are the one owner of edge-chrome sty
 `AuxiliaryGroupHeader` reuses the header component, and the shell's Project Home branch
 ([[submodule-web-shell]]) composes the exported `AuxiliaryRail` / `AuxiliaryRailToolButton` /
 `AuxiliaryPaneHeader` around its own geometry so a tool looks identical with or without a frame. Every
-rail entry is a `data-active` frame around the control, so the selected fill (`control-bg-selected`, the
-same role every tab strip uses) and the accent indicator sit on the frame while hover, focus, and drop
-cues sit on the control. Tab
+rail entry is a `data-active` 32px frame (24px in the bottom rail) around a control that wears the shared
+`ghost` M icon-button skin (`buttonVariants`, [[module-ui]] "Button system": 24px square, 16px icon,
+shared hover — pressed looks the same — and the ghost icon-only focus ring drawn inside the square, so no
+rail margin or strip edge clips it). The control keeps its own element for the roving toolbar, drag and drop and
+adornments; the open entry sets `data-selected` (the shared `control-bg-selected` fill), while drop cues sit on the
+control — the passive drop hint adds an inset `primary-soft` ring, so it still shows on a selected entry whose
+fill wins the background. Adornments (review badge, terminal ordinal) are offset to the 32px frame's
+corners and the join droppable is the frame itself, so neither shrinks with the 24px control. Tab
 and tool icons resolve in one place (`tabIcon`), Line at rest and Fill when active; rail tooltips open away
 from their edge. Rail geometry is excluded from available pane space, but
 saved dimensions remain workbench-wide ratios; viewport projection never rewrites them. Measurement
 observers follow the actual DOM node through ref attachment/cleanup, including keyed panel-group
 replacement; a mounted workbench does not imply its measured descendants survived. Rail selection is
-the tab strip's grammar turned sideways: the selected fill, a Fill icon, and a short accent edge (the
-rail's analogue of a resource tab's underline), identical in every theme — a palette decides how loud
-each reads, never a per-theme selector in the component.
+the selected fill plus a Fill icon (and `aria-pressed`) — no accent edge: the rail is a column of icon
+buttons, not a tab strip, so it carries no underline analogue. It is identical in every theme — a palette
+decides how loud it reads, never a per-theme selector in the component.
 
 ## Layout grammar
 
@@ -208,7 +213,8 @@ Pointer is never the sole arrangement path. Keyboard controls and shadcn menus c
 Center resource strips and auxiliary terminal-session strips have bounded readable tab widths and no fixed previous/next controls: wheel, trackpad, touch,
 roving-keyboard navigation, active reveal, and the searchable keyboard overflow list scroll the same list.
 Native scrollbars stay hidden; pointer-transparent edge fades appear only where clipped and update without
-changing the fixed 28 px strip. Full-height strip actions share that width. A control renders only when it can
+changing the fixed 28 px strip. Strip actions are shared `IconButton ghost m` controls (24 px squares,
+vertically centred in the strip) rather than full-height cells. A control renders only when it can
 act: overflow search only while clipped; every expanded auxiliary pane has a Hide action because its rail
 remains available for restoration. Singleton tool icons have no inline close glyph; explicit Remove tool
 from group stays in their menu and on Delete, separate from pane visibility. Terminals and center
@@ -231,10 +237,13 @@ preview, the four splits) and auxiliary terminals carry no splits.
 
 Balanced, Focus, and Review are web-owned resource-free frame definitions with a below-center bottom slot:
 Balanced and Review show it; Focus hides it. Balanced and Focus start with one center group; Review provides
-its deliberate vertical pair. Custom presets use the same grammar and capture geometry,
+its deliberate vertical pair. Balanced's lower right group opens on the TODO List with Review beside it: on a
+fresh workspace the plan is what there is to look at, while review comments only exist once there is a diff. Custom presets use the same grammar and capture geometry,
 topology, tools, folds, and empty structural slots, never workspace resources or terminal count. Preset node
 ids are template-local labels: instantiation mints frontend-local frame ids and returns the old→new group map
-used to rehome every workspace view. Only custom definitions cross the wire through settings. Built-in preset
+used to rehome every workspace view. Only custom definitions cross the wire through settings; a set that
+places the TODO List (`plan`) is saved only to a host at `LAYOUT_PLAN_PRESET_PROTOCOL_VERSION` or newer — an
+older host's validator rejects the tool, so Layout settings explains that instead of sending it. Built-in preset
 names are display copy: `layoutPresetName` renders them through the locale catalog by preset id while the
 definition keeps its stable `name`; custom preset names are user data and render verbatim.
 

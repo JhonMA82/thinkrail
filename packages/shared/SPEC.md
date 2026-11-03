@@ -31,6 +31,10 @@ bundled into `apps/web`. Exposed through explicit subpath exports, not a barrel.
   `@thinkrail/shared/paths` → the worktree-relative path conventions (`WORKSPACE_INTERNAL_DIR`,
   `WORKSPACE_CONTEXT_DIR`, `WORKSPACE_TODOS_DIR`);
   `@thinkrail/shared/codedError` → `CodedError` + `errorCodeOf()`;
+  `@thinkrail/shared/toolHomes` → `toolHomeEnv(home)`, the environment that points every agent tool's
+  config home (Claude Code, Codex, Gemini, Copilot, Kimi, Grok) under one sandbox home and clears the
+  overrides that would reach outside it — the single list every hermetic host spawner (e2e, workflow
+  harness, artifact probes) applies, so a new detection source cannot leak the developer's real sign-ins;
   `@thinkrail/shared/removeTree` → `removeTree()`, the retrying recursive remove every teardown of a tree
   a child process ran from goes through;
   `@thinkrail/shared/spawn` → `spawnSyncCaptured()` + `spawnSyncCapturedBytes()` + `spawnDetached()`, the
@@ -324,3 +328,6 @@ bundled into `apps/web`. Exposed through explicit subpath exports, not a barrel.
   `SO_REUSEPORT`), so a bind-and-catch check is unreliable. A refused connection means free.
 - `findFreePort` scans upward from `preferred` (predictable: `24242 → 24243 → …`) and falls back to an
   OS-assigned ephemeral port if the whole scan range is taken.
+- Its answer is a snapshot: another process may bind the port before the caller does, and a later connect
+  probe of an ephemeral-range port can self-connect. Callers bind promptly; tests never re-probe the result
+  (that re-probe flaked under parallel package tests).

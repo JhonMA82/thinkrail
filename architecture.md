@@ -20,8 +20,8 @@ dials it over the network; a phone reaches the selected host over Tailscale.
 
 - **Engine host** (`packages/server` + `packages/shared`, launched by `apps/cli` or `apps/desktop`
   in local-host mode): owns `pi`, session state, persistence, and serves the wire endpoint. It bundles pi extensions
-  (`pi-web-access`, `pi-spec-graph`, `pi-thinkrail-workflow`, `pi-todos`) and the ThinkRail extensions
-  from its server registry (`visualize`) into every session.
+  (`pi-spec-graph`, `pi-thinkrail-workflow`, `pi-todos`) and the ThinkRail extensions from its server
+  registry (`visualize`, `ask-user-question`, `web-access`) into every session.
 - **The wire** (`packages/contracts`): the typed, versioned protocol — the only coupling between client
   and host.
 - **UI client** (`apps/web`): a mobile-first React client, transport-driven and endpoint-configurable,
@@ -53,7 +53,7 @@ packages/pi-thinkrail-workflow pi extension: the workflow skill system + its alw
 pi-extensions/*     portable pi packages published to npm as @thinkrail/pi-<name>; work in vanilla pi
                     (decided, Decision 20; the pi-* packages above move here per publish wave)
 thinkrail-extensions/*  ThinkRail extensions: a pi capability + ./server and ./web halves, composed by one
-                    registry file per side (Decision 21; visualize shipped) ── depends on ─▶ pi-extensions/*,
+                    registry file per side (Decision 21; visualize and ask-user-question shipped) ── depends on ─▶ pi-extensions/*,
                     packages/extension-api, packages/ui, packages/locales (web half)
 packages/extension-api  types + define* helpers for extension halves ── depends on ─▶ packages/contracts, packages/locales (types)
 packages/ui         owned shadcn/Radix primitives + cn + onThemeSwap ── may depend on ─▶ packages/contracts, packages/locales
@@ -88,7 +88,8 @@ dependency. This keeps test process drivers outside both launchers and the serve
    reuse is enforced by boundaries and conformance rather than parallel implementations.
 3. **The wire is versioned.** `contracts` is types plus a small dependency-free runtime: wire constants,
    versions, the config default, and guards. Any other runtime is a named exception in its spec, today
-   only the quit-confirmation rule; adding one updates this decision. `server.welcome` carries a
+   the quit-confirmation rule and the search matcher (the palette's ranking, kept in `contracts` so host-side
+   search can rank with the same copy); adding one updates this decision. `server.welcome` carries a
    protocol version so an independently-shipped UI can detect host-version drift.
 4. **Transport endpoint is a parameter.** Defaults to same-origin (`location.host`); a remote browser,
    desktop, or mobile client points it at the selected host's Tailscale MagicDNS name. Native resume state
@@ -110,7 +111,9 @@ dependency. This keeps test process drivers outside both launchers and the serve
    whose cwd is the project folder itself (git's *main working tree*) — non-removable, non-renamable,
    and entered explicitly from the project's Welcome fork ("Work in project folder"), never
    auto-entered — the "just work in my project folder" anchor for users lost in the
-   worktree model; and an **existing worktree** the user explicitly attaches in place
+   worktree model. The one exception is a project ThinkRail just created empty with the spec-drafting
+   switch on: it enters Default for that setup chat, because a fresh repo has nothing to isolate yet
+   ([[submodule-web-panels]]); and an **existing worktree** the user explicitly attaches in place
    (`kind: "external"`), which ThinkRail may forget but never mutates (see
    [[submodule-server-workspaces]]). The shell is built first,
    `pi` connected last. **Open PR** is a deterministic, host-side push + open/update of the branch's
@@ -118,7 +121,9 @@ dependency. This keeps test process drivers outside both launchers and the serve
    the verified plan, with a compare-URL fallback when `gh`/GitHub isn't available (see
    [[submodule-server-pr]]).
 7. **Auth is external.** Tailscale ACLs / device identity are the auth; the app carries an `owner` field,
-   not a login UI.
+   not a login UI. The host sends no CORS headers, and its one HTTP write route (`PUT /fonts/<file>`)
+   requires a non-simple request header, so a website the user visits cannot write through it
+   ([[submodule-server-host]]).
 8. **Hydrate-then-stream (every client reconstructs domain state from the host).** A client never relies on
    having *witnessed* events to know domain state—on connect it **reads** current state, then **subscribes**
    to live deltas. The host exposes `project.list` / `workspace.list` / **`session.list`** /
@@ -131,7 +136,8 @@ dependency. This keeps test process drivers outside both launchers and the serve
    explicit reopen. This one auto-open attempt fires once per surface-workspace connection, not on every
    catalog re-read, and a surface resolving an exact-chat route target defers it entirely to that target.
    `session.created` supplies that history-only live delta when another frontend starts a session; reconnect
-   repairs a missed delta through `session.list`. The client is a **stateless
+   repairs a missed delta through `session.list`, and the normalized state snapshot carries every chat's
+   name, so a chat this client never listed is named without a `session.list`. The client is a **stateless
    projection of domain state**, never a second domain source of truth; it separately owns frontend-local
    navigation and workbench view state. An automatic agent run
    remains active through retries, compaction, and queued continuations: pi's `agent_end` is only an
@@ -207,7 +213,8 @@ dependency. This keeps test process drivers outside both launchers and the serve
     rejects any range, any catalog drift, and a lockfile graph that resolves `react` or `react-dom` outside
     its one catalog pin (the React pin rationale belongs to [[module-web]]). Every pi
     upgrade also follows [[pi-compatibility]], the architecture-owned registry of host adaptations and
-    their removal gates; detailed rationale stays in the owning module specs. Exempt:
+    their removal gates; detailed rationale stays in the owning module specs. Any other root `overrides`
+    entry is an exact security pin whose rationale and removal gate live with its owner. Exempt:
     `peerDependencies` (extension packages declare `"*"` on purpose — the host provides the dep) and local
     protocols (`workspace:` / `link:` / `file:`). An exact SemVer prerelease/build suffix is still an exact
     pin (`19.3.0-canary-a1124489-20260826`); the checker accepts the full identifier grammar, including
@@ -314,7 +321,11 @@ dependency. This keeps test process drivers outside both launchers and the serve
     into the current-chat Resources view. Parent session entries own injected command services and
     retained subagent completion delivery across extension reload; scoped reads, controls, and
     invalidations are composed through the agent barrel. Detailed integration belongs to
-    [[submodule-server-agent]], and command lifetime/retention to [[module-pi-background-commands]].
+    [[submodule-server-agent]], and live command lifetime and runtime retention to
+    [[module-pi-background-commands]]. What Resources keeps past a host restart — every finished record and
+    command log tail of a chat, for the workspace's lifetime — is a host archive,
+    [[submodule-server-resource-history]], fed and read only by `agent`; the portable packages stay
+    in-memory, so an archived record never becomes control authority (user-settled, 2026-10).
 
 19. **The review surface is engine-neutral; renderers are registered, not hard-wired.** A resource (a
     file or one side-pair of a diff) is shown by the renderer the `@thinkrail/resource-renderers` registry selects by
@@ -365,8 +376,9 @@ dependency. This keeps test process drivers outside both launchers and the serve
     deleted — none of which changes anything a user can observe. **Enable/disable has shipped:** Settings →
     Extensions lists the server registry (`extension.list`) with a switch per extension; the global
     `AppConfig.disabledExtensions` reaches `agent` through a host-injected resolver (no `agent` → settings
-    edge), which filters registry factories at every loader (re)load and withholds a disabled extension's
-    tools from live sessions through pi's active-tool API, while web renderers stay registered so past
+    edge), which filters registry factories **and their skills** at every loader (re)load and withholds a
+    disabled extension's tools from live sessions through pi's active-tool API — reloading an idle session
+    only when that extension's skills are loaded in it — while web renderers stay registered so past
     transcripts render. Install UX, marketplace, per-extension settings, a per-workspace on/off override
     and runtime-loaded third-party extensions remain explicit deferrals. Rejected: runtime-loaded
     bundles now (React singleton, versioned UI API, security story first), a logical extension inside
@@ -377,7 +389,24 @@ dependency. This keeps test process drivers outside both launchers and the serve
     layouts). Pilot, shipped in three PRs: visualize — `lovely-mermaid` for TUI rendering and
     best-effort validation in the portable package, strict `mermaid`+`linkedom` validation injected by
     the ThinkRail server half through `createVisualizeExtension({ validateMermaid })`; the old
-    `packages/pi-visualize` is deleted. Detail: [[module-thinkrail-extensions]].
+    `packages/pi-visualize` is deleted. Second: ask-user-question — the portable package asks through a
+    terminal questionnaire or per-question dialogs; ThinkRail composes it per parent session through the
+    registry's `sessionExtensions(session)` seam with an asker over the host's **interactive-tool
+    mailbox** (`awaitToolResponse`) — the first per-session host service an extension receives. The
+    mailbox, restart repair, late responses, composer supersede, Stop/Submit, needs-input and the web
+    `interaction` props are **tool-agnostic**: keyed by `toolCallId`, told which tool names wait for a
+    person by the descriptor's `interactiveTools` and the renderer's `interactive` flag, and never
+    naming a tool in `contracts`, `agent` or `apps/web`. `ask_user_question` is the first client of that
+    contract, not a special case; the extension is deletable without touching the core (the vanilla
+    package then falls back to pi's `ctx.ui` dialogs, which the host already renders). Product rule: a
+    built-in (registry) extension wins a same-name tool collision with a user package while it is
+    enabled; switched off, the package's tool runs ([[pi-compatibility]] holds the pi-level mechanism).
+    Third: web-access — the first wrap of a **third-party** pi package (`pi-web-access`), so there is no
+    package of ours to publish and delivery collapses to the server half; its renderers stay app-local
+    until the components they use join the SDK. It loads everything the package declares, as `pi install`
+    would — tools and its `librarian` skill — and is the first extension with skills, so the switch now
+    drops an extension's skills with its tools (launchers stage them under an owner folder so ownership
+    survives flattening). Detail: [[module-thinkrail-extensions]].
 
 22. **A path's spelling follows its kind.** A directory identity (`Project.path`,
     `Workspace.worktreePath`) is the host's **resolved** spelling (`path.resolve`), exactly what pi records as a
@@ -414,9 +443,11 @@ dependency. This keeps test process drivers outside both launchers and the serve
     theme. Agent, tool, skill, prompt output and server error text are never translated. Stored and wire
     data never carry translated text: defaults ThinkRail writes (untitled chats, default terminals, the
     host-named default workspace, chat round notices) are worded at render, so a switch re-words all of
-    them, while names set by the user or the agent show verbatim. This is the
-    one runtime-loaded user resource; code extensions and themes stay compiled in (Decision 21 and the
-    themes non-goal) because a string map renders as escaped text and carries no executable surface.
+    them, while names set by the user or the agent show verbatim. Theme manifests are the one other
+    runtime-loaded user resource, on the same model (`~/.thinkrail/themes/*.theme.json`, read by
+    [[submodule-server-themes]], validated by [[submodule-web-themes]]): a manifest is colour data only
+    and is written as CSS custom-property values, never CSS or code. Code extensions stay compiled in
+    (Decision 21) because a string map or a palette carries no executable surface and an extension does.
     Rejected: English-text keys (a wording fix orphans every translation); a host-served bundled catalog
     (bundled strings belong to the web build that renders them); an in-house runtime (i18next chosen for
     its standard format and tooling); catalogs in `contracts` (data and translation logic are not wire

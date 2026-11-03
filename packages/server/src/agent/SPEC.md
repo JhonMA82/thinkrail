@@ -5,7 +5,7 @@ status: active
 title: agent — in-process pi sessions
 parent: module-server
 depends-on: [module-contracts, module-pi-delegation, module-pi-subagents, module-pi-background-commands]
-references: [module-spec-graph, central-integration, submodule-server-extensions]
+references: [module-spec-graph, central-integration, submodule-server-extensions, submodule-server-agent-packages]
 tags: [pi]
 ---
 
@@ -15,8 +15,9 @@ The in-process `pi` engine: a current shared model/auth runtime generation for p
 chats, the lifecycle of `AgentSession`s (one per chat tab, rooted in a workspace's worktree and retaining the
 runtime generation they were created with), Pi resource/skill loading (including portable
 cross-agent skill discovery + a pre-session skill catalog), the **extension-UI bridge** that turns pi's
-in-process `uiContext` dialog calls into WS frames, the host-owned **`ask_user_question`** tool + its
-answer-injection path, and the **restart repair** that keeps re-opened transcripts provider-valid.
+in-process `uiContext` dialog calls into WS frames, the **`ask_user_question`** answer mailbox and
+answer-injection path behind the ask-user-question extension, and the **restart repair** that keeps
+re-opened transcripts provider-valid.
 
 ## Boundary
 
@@ -90,6 +91,8 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
     attached after activation keeps its saved model when that model is available in the current runtime.
     If it is unavailable, Pi chooses its settings default, then its ordered provider defaults, then the
     first available model; this need not match ThinkRail's AppConfig default or the saved provider.
+    The exception is a model pi still lists but the account does not serve (`modelAvailability` filtered
+    it), which pi would otherwise restore verbatim; the host passes `preferredDefaultModel` instead.
     Opening does not change the saved model. An ordinary physical-model fallback becomes durable when
     Pi appends an assistant response, not at send acceptance; explicit model selection persists at once.
     Merely opening a chat preserves its original model for when that provider returns. The host exposes
@@ -98,7 +101,7 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
     placeholder model is persisted as a replacement.
 
     Every models **read** goes through **`settledAvailableModels(runtime)`** — pi's
-    `getAvailableSnapshot()`, **never `getAvailable()`**: that one awaits `refreshAvailability()`, which
+    `getAvailableSnapshot()` narrowed by `modelAvailability`, **never `getAvailable()`**: that one awaits `refreshAvailability()`, which
     returns the pending per-provider auth fan-out *or starts one*, all unsignalled — so reading through it
     would hand `model.list` (whose contract is to answer without touching the network), `model.default` and
     every inbound model-ref check an unbounded wait, and would escape the refresh deadline one line after
@@ -107,8 +110,37 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
     credential or configured key is registered — config and native (`registerNativeProvider`) registrations
     alike, so a Central or delegation-mirrored provider is readable before its availability pass lands. Being
     the one read makes the picker, default, and model resolution agree within a generation.
+  - `modelAvailability` — narrows that snapshot to what the **connection** serves; pi's catalogs are
+    per-provider, not per-account, so a provider pi calls configured can still 400 on most of its catalog.
+    Two rules, each scoped by `baseUrl` so custom or rerouted models are untouched: **Sign in with ChatGPT**
+    (`openai` + OAuth against `api.openai.com/v1`) keeps only ids in pi's own `openai-codex` catalog — the
+    ChatGPT backend rejects the API-only rest (`gpt-4`, `gpt-4o`, `o1`, …) with `model_not_found`; and an
+    **opaque (Central) provider** keeps the ids its proxy advertises on `GET /models` (OpenAI wire) or
+    `GET /v1/models` (Anthropic wire), an alias matching a listed `-YYYYMMDD` / `-YYYY-MM-DD` dated id
+    (the proxy resolves `gpt-4o` to `gpt-4o-2024-11-20`). Listings are read with pi's resolved auth beside
+    `refreshCatalogs` (detached on `model.list`, awaited and forced on `model.refresh`), single-flighted,
+    5s-bounded end to end (one deadline covers credential resolution and the fetch, so a stalled OAuth
+    refresh cannot wedge the single flight), throttled to 60s per runtime, and a change publishes
+    `provider.changed` so the picker re-reads; an unknown wire or a never-read listing filters nothing,
+    and a failed re-read keeps the last listing. Failures log only a closed count, never provider ids or
+    the provider's error text. Direct API keys and other subscriptions keep pi's catalog: no listing was verified to
+    agree with pi's aliases there.
+  - `modelDefaults` — `preferredDefaultModel(available)`: pi's `defaultModelPerProvider` in pi's order,
+    then any available model whose id is one of those defaults, else the first available model. Pi does
+    not export that map, so the host mirrors it under a parity test against the installed dist; the first
+    pass is what pi's own `findInitialModel` would pick. The same-id pass covers a provider whose own
+    default the account filter removed: Sign in with ChatGPT serves `openai` models from the
+    `openai-codex` set, so it lands on the Codex default instead of catalog order.
+  - `modelsFile` — the one owner of pi's shared `getAgentDir()/models.json` IO for the settings adapters
+    below: BOM-preserving JSONC parse with `jsonc-parser` (comments and unrelated configuration survive),
+    refusing invalid JSON or a read-only file rather than patching it, a temp file written beside the
+    resolved target with the original's mode (`0o600` for a new file) and renamed into place — following a
+    symlinked `models.json` to its target, and creating a dangling link's target rather than replacing the
+    link — one in-process write chain both adapters queue on (so their read-modify-writes never
+    interleave), and the `provider.changed` publisher seam (`setModelsFilePublisher`). Error messages are
+    generic and never carry file contents.
   - `modelContext` — a narrow settings adapter for the `contextWindow` override in pi's shared
-    `getAgentDir()/models.json`, not a second model registry. It lists the OpenAI Responses / Codex
+    `models.json`, not a second model registry. It lists the OpenAI Responses / Codex
     Responses models from `settledAvailableModels` whose effective budget still equals the contracts'
     272K editing minimum (the cap this setting exists to lift), plus any model that already carries an
     override so it can always be reverted; each entry pairs pi's effective `contextWindow` with the
@@ -116,18 +148,66 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
     from a model-id list, so catalog defaults above 1M stay untouched by a bulk save. A save validates
     the contracts' 272K–1M range first, patches `providers.<p>.modelOverrides.<id>.contextWindow` for the
     target — or, for `available`, every eligible pair the contracts' `isSharedModelContextTarget` admits, so
-    a shared save never rewrites an override outside the range that only a targeted save can touch — with
-    `jsonc-parser` so comments, BOM and unrelated
-    configuration survive, prunes override objects it empties (never `providers`), refuses invalid JSON
-    or a read-only file rather than patching it, then writes a temp file beside the resolved target with
-    the original's mode (`0o600` for a new file) and renames it into place — following a symlinked
-    `models.json` to its target, and creating a dangling link's target rather than replacing the link. Saves are serialized in-process; a changed file is followed by one
+    a shared save never rewrites an override outside the range that only a targeted save can touch — and
+    prunes override objects it empties (never `providers`), writing through `modelsFile`; a changed file is followed by one
     network-disabled `runtime.refresh` on the current generation and the host's `provider.changed`
     signal; a no-op save does neither. Every read also refreshes locally first so external pi CLI edits
     appear. Live sessions keep the model they were created with; new chats resolve the updated metadata.
-    pi owns schema validation and the effective value; error messages are generic and never carry file
-    contents. Accepted gap: a Central rebuild whose runtime loaded the file before a save and activated
+    pi owns schema validation and the effective value. Accepted gap: a Central rebuild whose runtime loaded the file before a save and activated
     after its refresh serves the old budget until the next read refreshes it.
+  - `customEndpoints` — the settings adapter for the user's own OpenAI-compatible servers (a company
+    gateway or a local llama.cpp / vLLM / sglang / Ollama / LM Studio server), again a `models.json` editor
+    and not a registry: each is a `custom-*` provider with `api: "openai-completions"`, served by pi like any
+    hand-written one, so the pi CLI sees the same models. Only `custom-*` entries are listed, edited or
+    removed; every other provider is left byte-for-byte alone. A saved address the form would refuse
+    (credentials, a query string, not http/https) is not listed either, so its secret never reaches a
+    client; pi still serves it.
+    - **Probe without a server kind.** The base URL loses `/models` / `/chat/completions` / `/completions`
+      suffixes and is refused with credentials or a query string. The host `GET`s `<base>/models` (5s) and,
+      only on a 404 for a base without `/v1`, `<base>/v1/models` once (whose failure is reported unless it
+      is also a 404). The only standard part of that
+      listing is the model ids, so limits come from what servers add to it — `max_model_len` (vLLM, sglang),
+      `max_input_tokens` / `max_output_tokens` (LiteLLM), `context_length`, llama.cpp `meta.n_ctx` — and from
+      same-origin best-effort extras run in parallel (3s each): llama.cpp `/props` (per-slot `n_ctx`, an
+      `enable_thinking` template, `supports_tools`), Ollama `/api/version` then `/api/show` per model
+      (`num_ctx`, capabilities; non-`completion` models dropped) and LM Studio `/api/v0/models` (loaded
+      context, `vlm`, `tool_use`; embeddings dropped). An extra that fails or 404s only leaves facts
+      unknown, so a gateway costs a few harmless 404s. Training lengths are ignored. Failures return a
+      closed reason, never a response body. Probes run on the host because the agent talks to the server
+      from there (and a browser would hit CORS).
+    - **Write only reported facts (decision).** A model's `contextWindow`, `reasoning` and `input` are
+      written only when reported; otherwise pi's defaults apply — 128K context, with pi's overflow
+      recovery compacting and retrying once when the server returns a recognized "context exceeded"
+      error (accepted gap: a server that silently truncates, like Ollama by default, gives it nothing to
+      recover from). `maxTokens` is the reported max output when it fits the context, else ¼ of a known
+      context clamped to 256–16K (pi's 16K default would fail vLLM's prompt + `max_tokens` check on a
+      small context, and compaction cannot recover from that), else omitted. Cost is zero. A new provider
+      gets conservative compat (`supportsStore: false`, `supportsDeveloperRole: false`, `maxTokensField:
+      "max_tokens"`) because pi detects compat from the URL and would send OpenAI-only fields to an unknown
+      host; every OpenAI-compatible server accepts these. An edit keeps the provider's `compat` and every
+      field the form doesn't manage, and removes the managed fields from that model's `modelOverrides`,
+      which pi would otherwise apply over the saved values.
+    - **Keys.** The key never crosses the wire (`hasApiKey`). A typed probe key resolves a whole `$VAR` /
+      `${VAR}` reference and is otherwise used literally; a `!command` is never run by a probe (a narrow
+      subset of pi's resolver, enough for Detect, not a mirror of it). A probe naming `endpointId` reuses
+      the saved key only for that `custom-*` endpoint's unchanged address. The key and the address are
+      read from the same `models.json` snapshot and the saved key goes through the same probe rules —
+      never pi's `runtime.getAuth`, which runs `!command` keys and may still hold an older file's
+      configuration — so a command-backed key is probed without a key (the user can type one), and an
+      externally changed address never receives the previous key. Any other address is probed without it,
+      and a keyed probe refuses redirects.
+    - **A server keeps its origin (decision).** pi resolves auth by provider id at request time while a
+      live session keeps the model object it was created with, so changing a provider's origin under the
+      same id lets a refreshed key reach the old origin from an open chat, or an old key and hand-written
+      `headers` reach the new one. An edit may change the path within the same origin; a different server
+      is added as a new one, with a new id. A save is also refused while a model or model override routes
+      to its own `baseUrl` on another origin, which the form neither shows nor manages. An empty key writes
+      the `thinkrail-no-key` placeholder pi needs to count the provider as available. For the same reason
+      a new server's id is never reused: it is `custom-<name or host slug>-<6 random hex>`, so removing a
+      server and adding another with the same name can't hand the new key to a chat still open on the old
+      one.
+    - A save or removal that changes the file refreshes the runtime (best-effort; a refresh failure is
+      logged, since the file is already written) and publishes `provider.changed`; a no-op does neither.
   - `agentSessionManager` — sessions keyed by `session.sessionId` (each `Entry` also tracks its
     `workspaceId`), `createSession({ cwd, workspaceId, model?, thinkingLevel? })` → `createAgentSession(...)`
     with a per-session `SessionManager` **and `buildSessionSettings(cwd, projectTrusted)`** (the user's
@@ -199,14 +279,22 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
     flight; needs-input is never held. The command change listener and the delegation lifecycle listener
     republish the parent's state on a coalesced `setImmediate`, after the same-tick completion delivery
     that wakes the parent has already flipped it to running — so the last finishing child never flashes
-    the dot before the woken turn. A completion that does not wake the parent (user stop) releases the hold
+    the dot before the woken turn. The portable packages own that same-tick wake, also while their
+    post-settle idle flush is pending ([[module-pi-subagents]] Result delivery). Queuing the republish
+    behind that flush's `setTimeout(0)` instead was rejected: it leans on cross-module timer order and
+    still flashes whenever the flush runs late. The one remaining flash is a wake pi defers: a result
+    landing during the `agent_settled` emission, after this listener published idle. Only a settle handler
+    could deliver one there; ThinkRail's are synchronous and command exits arrive as I/O callbacks. A completion that does not wake the parent (user stop) releases the hold
     on that republish; a delivery gated by a reload or trash hold also releases first, and its later wake
     clears the unread again. Disk-only sessions have no live work and never hold. The same fact is published as
     `backgroundWork`, so clients show the idle chat as working (contracts' `isSessionWorking`) instead of
     quietly finished.
 
     State ids come from Pi's active session-entry chain: run/interruption from the latest user entry,
-    completion from the decisive assistant entry, questions/dialogs from their interaction ids. Disk state
+    completion from the decisive assistant entry, questions/dialogs from their interaction ids. A question
+    needs input from the live mailbox; without a live phase, an attached session reads it from the
+    transcript only as an acknowledged call (repair ack), while disk state still reads an unanswered
+    dangling call, which attach-time repair will ack. Disk state
     is reconstructed from the complete active branch; a file read/parse failure fails the all-workspace
     snapshot rather than omitting a row. Receipt initialization runs unless both metadata files load (first
     install, or a file persistence set aside as unreadable, which is logged): it marks existing completion
@@ -262,13 +350,13 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
     `listAvailableModels` / `listSettledModels` (the same snapshot without starting a refresh) / **`clampThinkingForModel`** (pi's `clampThinkingLevel` for a `{model, level}`
     pair — `model.clampThinking`; the host uses it so defaults and live-session effort changes follow Pi).
     Earlier, #394 showed ThinkRail's `available[0]` differed from Pi's pick and hit a proxy 400. ThinkRail
-    now resolves new-chat defaults host-side from `AppConfig`, falling back to the first available model
-    when the saved default is unavailable, without rewriting that setting. An explicitly requested
-    unavailable model is rejected rather than silently substituted. The host passes the chosen model
-    explicitly so the UI and session agree. Accepted risk: the first available model
-    may not be the provider default; users can set one in Settings → Models. Plan review uses this same
-    `resolveNewChatModel({})` for unset reviewer overrides: AppConfig `defaultModel`/`defaultEffort`, with
-    the first available model and `medium` effort as fallbacks.
+    now resolves new-chat defaults host-side from `AppConfig`, falling back to `preferredDefaultModel`
+    (pi's provider default, then the first available model) when the saved default is unavailable,
+    without rewriting that setting. `available[0]` alone was catalog order — `openai/gpt-4`, an 8K-context
+    model, for a fresh OpenAI connection. An explicitly requested unavailable model is rejected rather
+    than silently substituted. The host passes the chosen model explicitly so the UI and session agree.
+    Plan review uses this same `resolveNewChatModel({})` for unset reviewer overrides: AppConfig
+    `defaultModel`/`defaultEffort`, with the preferred model and `medium` effort as fallbacks.
 
     **Models cross the wire as `WireModel` (never pi's raw `Model`):** `toWireModel` projects a
     `Model` onto the wire's **allowlist** (see `WireModel`) — so `baseUrl`, `headers`, extension/provider
@@ -297,8 +385,8 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
     PI records the replacement when the user sends a message. Legacy transcripts with no persisted model
     reference also use PI's model resolver—then returns `{ summary, messages }` —
     `TranscriptMessage[]`: the pi-canonical subset **plus
-    `custom` messages**, which carry the `ask-user-answers` replies the questionnaire card pairs by tool
-    call id, **plus `compactionSummary`**, pi's durable marker for the messages compaction summarized away —
+    `custom` messages**, which carry the `tool-response` replies (and the retired `ask-user-answers` form in
+    older transcripts) an interactive tool's card pairs by tool call id, **plus `compactionSummary`**, pi's durable marker for the messages compaction summarized away —
     kept precisely because pi's resolved transcript is all that survives, so dropping it would hand the
     client a chat that starts mid-conversation with nothing to explain the gap. Which roles those are is
     **not decided here**: the filter is contracts' `isTranscriptMessageRole`, shared with `history`'s index
@@ -324,8 +412,8 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
     missing calls get pi's abort convention (`isError` "Operation aborted (host restarted…)"); a dangling
     ask gets the canonical ack (`details {kind:"ack"}`), so its card remains answerable while the transcript
     is provider-valid;
-    **`answerQuestion(sessionId, toolCallId, result)`** — the `ask_user_question` reply path (see the
-    `askUserQuestion` bullet); **`settleSessionsForShutdown(timeoutMs)`** — the polite half of shutdown:
+    **`respondToTool(sessionId, toolCallId, response)`** — the interactive-tool reply path (see the
+    `toolResponses` bullet); **`settleSessionsForShutdown(timeoutMs)`** — the polite half of shutdown:
     synchronously close every command service and subagent completion owner and start every hidden-child
     cascade before aborting any streaming parent. Preserve parents with a recoverable live ask phase
     (`expected`, `waiting`, or `answer-accepted-uncommitted`); dispose every hidden child (including those
@@ -394,8 +482,9 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
     single `runtime.completeSimple()` — pi's canonical provider-agnostic request path, which resolves
     the model's auth itself (OAuth refresh included) and also serves providers that only implement
     `streamSimple` (extension-registered ones). `pickModel(tier)` = the model choice: `cheap` prefers a
-    curated small/fast allowlist ∩ the authenticated set, else the cheapest by per-token cost; `default`
-    = first available; `null` when nothing is authenticated. This is the primitive the `assist` tasks
+    curated small/fast allowlist ∩ the authenticated set, else the cheapest priced model by per-token cost (an unpriced catalog entry is a free, preview,
+    or stealth tier that rate-limits or disappears), else the `default` pick; `default`
+    = `preferredDefaultModel`; `null` when nothing is authenticated. This is the primitive the `assist` tasks
     (plan summaries, PR drafting) run on — the only place model **dispatch** happens outside a session.
   - `webUiContext` — `createWebUiContext(sessionId, currentToolCall?)` builds the `ExtensionUIContext` pi
     calls (dialogs round-trip to the browser, fire-and-forget methods push). A dialog names the tool call
@@ -471,67 +560,100 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
     is a `Proxy` that throws `Theme not initialized` until `initTheme()` runs, and `initTheme` is called
     only from pi's own CLI entrypoints, never when pi is embedded via `createAgentSession`. Every
     embedder of pi-as-a-library hits this; an upstream fix would not reach us until a deliberate pi bump.
-  - `askUserQuestion` — the host-owned **`ask_user_question`** pi custom tool, registered per session with
-    a session-bound phase registry. New and reopened parent sessions create one `AskUserQuestionWaiters`
-    in `createParentSession`, shared by the SDK `customTools` definition and the registered entry.
-    SDK custom tools take precedence over same-name extension tools, including after resource reload.
-    This keeps the host's structured questionnaire and answer channel paired: an installed terminal
-    questionnaire must not replace execution with `ui.input` while the web client still renders the host
-    card. Other tools, commands, and hooks from that extension remain available. An eligible
-    live call is **sequential and blocking**: after validation its `execute` waits for
-    `session.answerQuestion`, then returns the person's real
-    `AskUserQuestionResult`/`buildQuestionnaireResponse` as the native tool result. Eligibility is shared:
-    an assistant stopped by `error`, `aborted`, or `length` cannot execute an ask. A `message_end` normalizer
-    makes the first ask the response's sole tool call (non-tool content stays; sibling calls are dropped for
-    the model to re-issue after the answer), avoiding Pi's sequential-abort hole where unexecuted siblings
-    receive no result. The question array has **no tool-level maximum**: one round carries every question
-    answerable now, while each question retains the 2–4 option bound. Header/label/`recommendedReason`
-    lengths are **advisory** (stated in the field descriptions, not schema `maxLength`): pi's schema
-    validation rejects the whole call and echoes every argument back, so a few extra characters would
-    cost a failed card plus a full retry, while the card already wraps/scrolls long text. Questions that
-    depend on an open answer wait for a later round; the multi-round interview norm itself lives in the
-    workflow family's `asking-user-questions` concept skill ([[submodule-workflow-skills]]).
+  - `toolResponses` — the host half of **interactive tools** (tools whose `execute` waits for the person):
+    the per-session response mailbox (`ToolResponseWaiters`), respondability, restart repair support and
+    late responses. The mailbox is **tool-agnostic**: every entry is keyed by `toolCallId`, the response is
+    an opaque value, and the only tool knowledge the host holds is the enabled registry extensions'
+    `interactiveTools` map (`extensions/interactive`) — which names wait for a person, and how a late
+    response reads to the model. `ask_user_question` is the first client ([[module-pi-ask-user-question]]
+    composed by [[module-ext-ask-user-question]]):
+    - The package owns the schema, validation, the `message_end` normalizer that keeps the first ask as
+      the response's sole tool call, the sequential `execute` and the result envelope.
+    - Its registry entry registers the tool through `sessionExtensions` and declares it in
+      `interactiveTools`.
+    - New and reopened parent sessions create one mailbox in `createParentSession`, and
+      `toolResponseSessionServices(waiters)` hands it to that seam as `expectToolResponse(toolCallId)`
+      and `awaitToolResponse(toolCallId, signal)`. A call enters the mailbox only when the extension
+      announces it, never by tool name: with the extension off, an `ask_user_question` call (the model
+      calling the absent tool, or a same-name package's tool) raises no needs-input, holds no completion
+      delivery, and its response RPC fails as not awaiting. The mailbox outlives resource reloads and the
+      extension switch: a question asked after re-enabling answers through the same mailbox, and a chat
+      created with the extension off adopts it through the one reload the toggle requests, ahead of any
+      same-name package.
+    - Response → `response`, supersede → `deferred` (the tool returns the pending marker and ends the
+      turn; pi still drains the queued composer message), dispose → `abandoned`. Stop rejections pass
+      through as the host's stopped error.
+    - `agent` imports nothing from an extension: the pending marker and its guard are `contracts`', the
+      pending and stopped texts are the host's own, and the late-response wording comes from the
+      descriptor's `describeResponse` (else a generic preface plus the response as JSON).
+    - A same-name tool from a user package loses to ours through the loader's `preferRegistryTools` order
+      ([[submodule-server-extensions]], registered in [[pi-compatibility]]). That keeps the structured
+      card and its answer channel paired: an installed terminal questionnaire must not replace execution
+      with `ui.input` while the web client renders our card. Its other tools, commands and hooks stay
+      available.
 
-    The registry tracks `expected` (eligible call observed), `waiting`, `answer-accepted-uncommitted`, and
-    `stopped` through `turn_end`. This includes Pi's real asynchronous gap from `tool_execution_start` through
-    pre-tool hooks to `execute`: graceful shutdown freezes new answer admission and preserves an expected call;
-    an answer accepted before that freeze remains authoritative and is persisted before shutdown/Stop aborts
-    its continuation. Stop-first synchronously marks an expected/waiting call stopped, so a later answer cannot
-    reverse the winner. Semantic validation still gates execution: an answer accepted in the pre-execute
-    window is acknowledged only if the real ask returned and `turn_end` contains its result; validation error
-    or a missing result rejects the answer RPC rather than hanging or claiming success. Every expected call Pi
-    does not execute is cleared at `turn_end`. The answer RPC resolves the phase and acknowledges only after
-    the matching result reaches the persisted `turn_end` boundary. Explicit Stop drains the queue and aborts
-    an unanswered phase with a stable stopped error; after Submit wins, Stop defers Pi abort until the answer
-    persists and then ends only the continuation. Either ordering leaves one terminal provider-valid result.
+    An eligible live call is **sequential and blocking**: after validation its `execute` waits for
+    `session.respondToTool`, then returns the person's real response through the tool's own envelope as
+    the native tool result. Eligibility is shared: an assistant stopped by `error`, `aborted`, or `length`
+    cannot execute an interactive call. Questions that depend on an open answer wait for a later round;
+    the multi-round interview norm itself lives in the workflow family's `asking-user-questions` concept
+    skill ([[submodule-workflow-skills]]).
 
-    **Typing instead of answering supersedes the live card, exactly as after a restart.** `steerSession` and
-    a streaming-time `promptSession` queue the text in Pi's steering lane first and, only when `steer()`
+    The registry tracks `expected` (eligible call announced), `waiting`, `response-accepted-uncommitted`,
+    and `stopped` through `turn_end`. This includes Pi's real asynchronous gap from `tool_execution_start`
+    through pre-tool hooks to `execute`: graceful shutdown freezes new response admission and preserves an
+    expected call; a response accepted before that freeze remains authoritative and is persisted before
+    shutdown/Stop aborts its continuation. Stop-first synchronously marks an expected/waiting call stopped,
+    so a later response cannot reverse the winner. Semantic validation still gates execution: a response
+    accepted in the pre-execute window is acknowledged only if the real tool returned and `turn_end`
+    contains its result; a validation error (the tool's asker throws) or a missing result rejects the
+    response RPC rather than hanging or claiming success. The proof needs no receipt from `execute`, which
+    lives in the package. `persistTurn(toolResults)` matches results to waiters by `toolCallId` and
+    accepts only a non-error result whose `details` deep-equal the accepted response: `details` is the
+    response itself, so the proof never depends on the wording the tool gives the model. A post-tool hook
+    that rewrites only the content is acknowledged, since the response did persist; one that replaces
+    `details` or turns the result into an error rejects the RPC. Rejected: comparing the rebuilt envelope
+    too (it tied the host to the tool's text and reported a persisted answer as lost whenever another
+    extension rewrote tool output). Every expected call Pi does not execute is cleared at `turn_end`. The
+    response RPC resolves the phase and acknowledges only after the matching result reaches the persisted
+    `turn_end` boundary. Explicit Stop drains the queue and aborts an unanswered phase with a stable
+    stopped error; after Submit wins, Stop defers Pi abort until the response persists and then ends only
+    the continuation. Either ordering leaves one terminal provider-valid result.
+
+    **Typing instead of answering supersedes the live card, exactly as after a restart.** `steerSession`
+    and a streaming-time `promptSession` queue the text in Pi's steering lane first and, only when `steer()`
     reports the `queued` disposition (an extension `input` handler that returns `handled` queues nothing, so
-    no user turn would follow the ack), `supersede()` every expected/waiting call: the tool returns the same canonical ack (`ASK_ACK_TEXT`, `details {kind:"ack"}`)
-    the restart repair writes, Pi drains the steering message as the next user turn, and the card derives
-    `superseded` from the transcript through the one shape it already understands (ack + later user
-    message). A later answer RPC fails with the `superseded` answerability error; a call already in
-    `answer-accepted-uncommitted` is never superseded (the answer wins and the steering delivers after it).
-    Scope is deliberately narrow: only the user's own composer send supersedes — the follow-up lane
-    (Cmd+Enter), steering queued *before* the card appeared, `removeQueuedSession`'s internal re-queue, and
-    nudges (which already stop at `needsInput`) all leave the card open.
+    no user turn would follow the ack), `supersede()` every expected/waiting call: the tool returns the same
+    pending marker (`details {kind:"ack"}`) the restart repair writes, with `terminate: true` so Pi skips
+    the tool batch's own model request. Pi drains the steering message as the next user turn, and the card
+    derives `superseded` from the transcript through the one shape it already understands (pending marker
+    + later user message). A later response RPC fails with the `superseded` respondability error; a call
+    already in `response-accepted-uncommitted` is never superseded (the response wins and the steering
+    delivers after it). Scope is deliberately narrow: only the user's own composer send supersedes — the
+    follow-up lane (Cmd+Enter), steering queued *before* the card appeared, `removeQueuedSession`'s internal
+    re-queue, and nudges (which already stop at `needsInput`) all leave the card open.
 
     A process restart deliberately changes only the continuation mechanism: attach-time repair writes the
-    canonical ack (`details {kind:"ack"}`) only for an eligible dangling ask before `createAgentSession`,
-    leaving the card answerable but the session idle. A length-truncated ask receives the same error repair
-    as any other non-executable tool call. With no live phase, `answerQuestion` injects the existing
-    `ask-user-answers` custom message through `sendCustomMessage({triggerTurn:true})`. Thus the question
+    pending marker (`details {kind:"ack"}`, the host's `TOOL_RESPONSE_PENDING_TEXT`) for an eligible
+    dangling call whose tool name is in the enabled `interactiveTools` map before `createAgentSession`;
+    respondability likewise reports a call of any other tool as unknown, leaving the card answerable but the
+    session idle. No argument-shape check: while ours is enabled it wins the name, and a disabled
+    extension's tool is simply not interactive, so a foreign same-name call gets the ordinary error repair.
+    A length-truncated call receives the same error repair as any other non-executable tool call. With no
+    live phase, `respondToTool` injects a `tool-response` custom message (content from `describeResponse`,
+    `details { toolCallId, response }`) through `sendCustomMessage({triggerTurn:true})`. Thus the question
     survives without restoring a JavaScript promise or calling low-level `Agent.continue`; an uncommitted
     Submit simply appears again. Queue entries remain Pi-owned and live-only by explicit scope. The card
-    derives both forms from the transcript (native live result versus repaired ack + custom answer).
+    derives both forms from the transcript (native live result versus pending marker + custom response).
 
     Rejected alternatives: immediate ack on every live call lets Pi drain input queued *before* the card
     and supersede it unseen; restoring a dangling invocation exactly requires a lifecycle-safe resume API Pi
     does not expose; a durable host queue/SQLite outbox is unnecessary when only the question must survive;
     a client-side "skip then steer" pair races the answer path and leaves a decline in the transcript
-    where the restored path leaves an ack.
-  - `sessionRepair` — `repairDanglingToolCalls(sessionManager)`: the restart safety net (rationale under
+    where the restored path leaves an ack; keying the mailbox on the tool name (the seam would be generic in
+    type only — a second interactive tool, or a third party's, could announce a call the web could never
+    answer).
+  - `sessionRepair` — `repairDanglingToolCalls(sessionManager, interactiveTools)`: the restart safety net (rationale under
     the manager bullet above). Pure over pi's `SessionManager` (compaction-aware via
     `buildSessionContext`; idempotent; appends only missing results from the active tail batch) —
     unit-tested against `SessionManager.inMemory`, including failed-attempt and historical-gap replay.
@@ -564,6 +686,43 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
     message. The count-aware cap also degrades a raw >2000px `read`-tool image to a note instead of a
     brick once a session crosses 21 images. Pure core (`guardOversizedImages`, `imageDimensions`)
     unit-tested with hand-built header bytes.
+  - `skillCarryover` — the post-compaction skill restorer: an inline extension in both
+    `buildResourceLoader`'s shared factories and `childBaseExtensionFactories`, so delegated children
+    carry it too. Pi's compaction summarizes a loaded skill's body away while the system prompt keeps
+    only its name and description, and `WORKFLOW_RULE` forbids re-routing work already routed. A
+    `SKILL.md` loaded by `read` — the normal path — is worse off: pi hands every tool result to the
+    summarizer cut to 2000 characters, so later rules never reach the summary. The agent then keeps
+    "following" a skill it can no longer see. Modeled on Claude Code's post-compaction re-attachment
+    of invoked skills: a **`context` handler** inserts ONE `thinkrail/skill-carryover` custom message
+    (`display: false`) right after the `compactionSummary` in every request while the branch has a
+    compaction. It restores each skill pi loaded (`before_agent_start`'s `systemPromptOptions.skills`)
+    that has a load — a `parseSkillBlock` user block or a successful `read` resolving to that skill's
+    `filePath` (after pi's `@`/`~`/`file://` handling and symlinks) — before the latest cut, unless the
+    loads at or after it already show the whole file; reads of other `SKILL.md` files do not count.
+    Any load before the cut, an excerpt included, is invocation evidence. In the kept tail each load
+    counts by the lines it showed, computed like pi's `read` (1-indexed `offset`, `limit`, and
+    `details.truncation.outputLines` when truncated; a `/skill:` block shows all): only when their union
+    covers every line of the current file does the body survive, so an excerpt never hides a compacted
+    load, and pages that together show the file are not paid for twice. Skills are ordered by their
+    latest load. Bodies are
+    re-read from the admitted skill file (frontmatter stripped, wrapped like pi's `/skill:` block) and
+    budgeted at 5K tokens of body per skill and min(25K, 10% of the context window) for the whole
+    rendered message (preamble, wrappers, truncation notices), newest first, truncated from the end
+    with a pointer to the file. The window must be the dispatched model's: `ctx.model` is the
+    selection, and a virtual selection's limits (0 by default) say nothing about the physical model
+    it routes to — pi's routed-capacity check runs before this handler — so a virtual selection, or
+    any model without a known window, gets no carry-over. The text is memoized per compaction entry, so
+    the injected prefix stays cache-stable. A per-request injection is the only placement that reaches
+    the first request after **mid-run threshold** and **overflow-retry** compaction: a
+    `session_compact`-time `sendMessage` is deferred to `turn_end` while a run is active, so those
+    requests went out without it. Nothing is written to the session, so the carry-over never reaches
+    the next summarizer as user text and pi's "Already compacted" guard still holds. Rejected for now:
+    a custom `session_before_compact` summary that records the active workflow step (it would replace
+    pi's summarizer call and own its credentials). `skillCarryover.test.ts` drives a faux pi session
+    through manual, mid-run threshold and overflow-retry compaction. The live `skill-after-compaction` spec pins that phases after a
+    compaction keep every rule with no re-read of `SKILL.md`: without the carry-over the agent recovered
+    by re-reading after each compaction (pi's summary told it to), so compliance alone did not tell the
+    two apart.
   - `delegation` — ThinkRail's embedding of the portable **`pi-delegation`** core +
     **`pi-subagents`** layer ([[module-pi-delegation]], [[module-pi-subagents]]): binds what only
     the host knows — the delegation root under the data dir (`<dataDir>/delegation`),
@@ -589,13 +748,12 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
     readout; crash recovery still comes from child transcripts and reconciliation. This is
     delegated spend's only accounting channel: delegation tools must never return `AgentToolResult.usage`,
     which pi would sum a second time. The write is best-effort, like pi's cache warmer: a failed append is
-    logged and never fails the child run. `recordSessionUsage` reports only whether pi took the usage into
-    its session; persistence stays uncertain. pi moves the leaf to a new entry before persisting it, so a
-    failed append restores the previous leaf (later entries must never chain to an unpersisted id, or a
-    reopened chat loses its history before it) and truncates an existing transcript back to its pre-append
-    size (a torn partial line would swallow the next entry); pi's initial file creation is outside this
-    repair. A usage entry pi kept only in memory counts in this process and is restored on disk by
-    reconciliation after the chat is reopened. Closing
+    logged and never fails the child run. `recordSessionUsage` reports whether pi took the usage into its
+    session: since pi 1.5 a failed append leaves pi's memory and leaf as they were (later entries never
+    chain to an unpersisted id), so the host reports `false`, the recorder keeps its watermark and the
+    increment rides the next write or reconciliation. The host still truncates an existing transcript back
+    to its pre-append size (pi appends with one `appendFileSync`, so a failed write can leave a torn partial
+    line that would swallow the next entry); pi's initial file creation is outside this repair. Closing
     a chat keeps its entry writable until its teardown cascade settles, so runs that cascade stops are
     still recorded; attach is refused during teardown, so the transcript keeps one writer. A deletion
     tombstone suppresses the write, because pi's append would recreate the trashed file. Graceful host
@@ -616,7 +774,8 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
     ignore floating-point noise) are missing, never as a negative correction. Forked children
     (header `parentSession`) are skipped because their copied history carries the parent's own spend.
     A host-injected `setSubagentConcurrencyResolver` supplies each service's per-chat
-    limit at creation, and `refreshSubagentConcurrency(workspaceId?)` re-resolves and live-resizes the
+    limit at creation (`null`, the default, leaves new services on the core limit), and
+    `refreshSubagentConcurrency(workspaceId?)` re-resolves and live-resizes the
     cached services (core `setMaxConcurrentPerParent`) after a global or workspace limit change; `subagentsFor(workspaceId, isEnabled, canDeliverCompletion)` creates one retained portable
     `Subagents` owner per parent; its extension is injected on every resource load. A host-injected
     `setSubagentsEnabledResolver` maps that
@@ -646,16 +805,55 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
     by default) idle-sync / streaming-deferred to `agent_settled`, latest policy wins, and
     `setActiveToolsByName` drops their guidance with them. Hooks of a disabled extension keep running in an
     open session until its next resource reload — pi cannot unload an extension, and reloading on every
-    disable would bust the prompt cache. The reverse is the one reload: an enabled extension the session
-    never loaded (created while it was off) and that did not fail to load triggers a gated
-    `requestSessionReload`. Registration applies the same reconciliation, and a completed reload reapplies
-    it without requesting another reload, so a toggle that lands mid-reload converges. Settings are the
+    disable would bust the prompt cache. Two cases do reload, gated through `requestSessionReload`: an
+    enabled extension the session never loaded (created while it was off) and that did not fail to load,
+    and a disabled extension whose **skills the session has loaded** (`loadsDisabledExtensionSkills`) —
+    skills live in the system prompt, which only a reload rebuilds, and a skill left behind would steer
+    the agent at withheld tools. Skill-less extensions keep the no-reload disable. An extension counts as loadable when it has static or per-session parent
+    factories. Registration applies the same reconciliation, and a completed reload reapplies
+    it without requesting another reload — unless the extension policy **moved while it ran**: a running
+    reload snapshotted the policy before the toggle, so its result can be stale (re-enable during a
+    disable reload would otherwise leave the extension unloaded with Settings showing it on).
+    `refreshExtensionTools` bumps a policy generation only when the disabled set actually changes; each
+    reload records the generation it started under, and its completion reconciles with a reload allowed
+    only if the generation moved, judging the **new** loader. An unchanged resend or a skill-less toggle
+    during a reload therefore costs nothing extra. Settings are the
     source of truth across restarts: Pi ≥ 1.3 restores a resumed chat's recorded tool loadout, keeping
     recorded removals inactive, so attach first re-activates every tool of an enabled registry extension
     that Pi's activated-on-registration rule would activate (declarable exposure, not `defaultActive:
     false`), then withholds disabled ones. Built-in, MCP, subagent and review tools keep Pi's restored
     selection. A registry tool switched off by anything other than Settings therefore returns after a
     restart, as it does on Pi `reload()`.
+    **Installed pi packages** have a switch of the same global shape, `setDisabledPackagesResolver`
+    (the `disabledPackages` setting; keys are [[submodule-server-agent-packages]] identities, since pi has
+    no "whole package off" concept and the user chose a ThinkRail setting over writing pi filter entries).
+    It is applied where pi reads declarations, not where it emits resources: every `SettingsManager`
+    the host opens comes from [[submodule-server-agent-packages]]' **`createPiSettings(cwd, agentDir,
+    { projectTrusted, packages })`**, whose `packages` view is `all` (the host's own reads and writes:
+    the catalog, the mutations), `enabled` (anything that loads resources for a chat —
+    `buildSessionSettings`, so parents and delegated children share it, `listSkillCommands`,
+    `listSkillCatalog`; the switched-off declarations are hidden from `getGlobalSettings` /
+    `getProjectSettings`, re-evaluated on every read) or `none` (a loader that resolves nothing from
+    packages — the boot runtime and extension-cache advance in `piRuntime`, the MCP sign-in probe,
+    `listProjectAliasSkillNames`, `isBuiltinExtensionEnabled`, the trust default read — since pi's
+    `reload()` resolves and installs declared packages whatever else is switched off). A view refuses
+    `setPackages` / `setProjectPackages`, so pi's `addSourceToSettings` can never persist a filtered
+    list, and a settings-view unit test fails on any other `SettingsManager.create` in the server
+    sources. pi therefore never installs, loads or lists a disabled package's extensions, skills or
+    prompts — including a declared-but-missing one that its install-while-loading would otherwise fetch
+    and whose lifecycle scripts would run — while the files on disk and the user's own per-resource
+    filters stay untouched.
+    *Rejected:* filtering resolved paths and `skillsOverride` / `promptsOverride` after pi resolved (the
+    first implementation): pi had already installed the package by then, pi assigns `sourceInfo.source`
+    only after the overrides run, and delegated children bypass those overrides. The **package policy**
+    (`packagePolicyKey`: the disabled set, a `packagesRevision` that `refreshPiPackages` bumps on every
+    install, remove, update or outside settings change, and a switch generation the host bumps on every
+    `disabledPackages` write — so a loader that resolved while a package was flipped off and back on
+    never compares equal to the restored set) joins the extension policy generation
+    above, and each session loader records the key it last resolved under; `isLoaderPackagePolicyStale`
+    is one more predicate of the reconciliation `applyExtensionTools` runs at registration, after every
+    reload and on `refreshExtensionTools`, so a session prepared under an older policy reloads when it
+    registers and a change mid-reload re-reloads — the fan-out alone would miss both.
     The **`set_title`** tool (`titleTool.ts`) is how chats and workspaces get named: the main agent calls it
     with `chat_title?` / `workspace_name?` / `branch?` (English kebab slug). It is always registered and
     active, and listed via `promptSnippet`; toggling it off after naming would rebuild the system prompt
@@ -712,15 +910,51 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
     Children opting into extensions
     (`extensions: true` in their definition) get the **curated child set**
     (`childExtensionFactories` in `extensions`, pi `InlineExtension`s): the headless-search policy +
-    `pi-web-access` + `pi-spec-graph` + every registry extension's `childExtensions` (named inline,
-    from [[submodule-server-extensions]]; none today) — deliberately not the parent's full set
+    `pi-spec-graph` + every registry extension's `childExtensions` (named inline, from
+    [[submodule-server-extensions]]; today `web-access`'s `pi-web-access`) — deliberately not the parent's
+    full set
     (rationale + the listed-children carve-out: core decision #25). **Every** child, opted in or not,
-    also loads the core's base set (`childBaseExtensionFactories`, same decision): just
-    `oversizedImageGuard`, since a child's `read` returns raw images under the shared settings (see the
-    `buildSessionSettings` bullet). Web-access reaches the child set via a **named bundled-seam
-    field** (`BundledExtensions.webAccessFactory`) in the binary and a Bun `require` in dev — its raw
-    third-party `.ts` must stay out of the strict tsc graph.
-  - `extensions` — Pi resource wiring. Candidate generation loads the reviewed external Central path once
+    also loads the core's base set (`childBaseExtensionFactories`, same decision): `oversizedImageGuard`,
+    since a child's `read` returns raw images under the shared settings (see the `buildSessionSettings`
+    bullet), and `skillCarryover`, since children auto-compact under those settings too.
+    A child on an extension-registered provider's model also loads that provider's **owning
+    extension** (core decision #32: such a provider may serve only sessions its extension observed):
+    `liveParentContext.providerExtensionPaths(provider)` answers from a process-wide owner map that
+    `buildResourceLoader`'s `extensionsOverride` fills from pi's load-time registration queues
+    (provenance: [[pi-compatibility]]), intersected with the parent's own loaded extensions. Process-wide
+    because an extension may register its provider only on its first load in a process; the intersection
+    keeps a child from loading an extension its parent lacks. Inline factories are never owners. While the
+    child's trust (the same `isProjectTrusted`) is false, project-scoped owners are left out too: a revoke
+    deferred on a busy parent leaves them in its loader, and an explicit path would load them anyway.
+  - `packages/` ([[submodule-server-agent-packages]]) — pi packages as a thing the host can list and
+    change: the read-only catalog (packages, loose extension files, the two host built-ins; chips and
+    load errors are what a chat's loader last recorded — `buildResourceLoader`'s `extensionsOverride`
+    reports every load through `recordLoadedExtensions` — so listing never executes extension code),
+    pi's identity rule, and the install / remove / update / toggle mutations in pi's own settings format.
+  - `piPackages` — the orchestration above `packages/`: the host-facing façade (`piPackagesCatalog`,
+    `piPackagesInstall`, …) that supplies the agent dir, the Central exclusion from the runtime
+    generation and `HOST_BUILTIN_EXTENSION_NAMES`; `refreshPiPackages()` (bump the package revision,
+    invalidate caches, `refreshExtensionTools()` so every registered session re-decides through the
+    gated reload — idle now, busy at `agent_settled` — and publish `packages.changed`; it runs after
+    Remove and Update **whether or not they succeeded**, since Remove persists before it uninstalls and
+    a batched update may have changed some packages before failing — the watcher cannot catch either,
+    having been primed by the host's own write); and the settings
+    watch: the agent-dir watcher behind `watchUserMcpConfig` also hands it `settings.json` edits, which
+    count only when the `packages` / `extensions` / `skills` / `prompts` arrays differ semantically from
+    the last seen (an unrelated edit or the echo of the host's own write is ignored; a mutation primes
+    the file right after persisting), and a workspace nudge touching `.pi/settings.json` goes through
+    the same comparison per worktree — only for a pi-trusted project, and only after the host primed the
+    file (at boot for every workspace record, and right after each of its own writes through the
+    mutations' `onPersisted` hook), so an untrusted repository's edits, the echo of the host's own
+    project-scope write, or the first sight of a worktree without the file never fan out a reload. A
+    declared-but-missing *enabled* package gets no host install: pi installs it the next time a chat
+    loads its resources, as it always did (a disabled one is hidden from pi, so it is never installed);
+    the page lists it as not installed with Remove.
+    **Known limitations, accepted:** several chats reloading at once can each resolve and install the same missing package
+    (pre-existing, as in pi CLI with two terminals; settings-first Remove narrows but does not close the
+    window for a resolve already in flight); Remove and Update change files on disk at once, so a busy
+    chat whose extension lazily imports or reads package files mid-turn may fail until its turn ends —
+    the same as `pi remove` beside a running pi, and deliberately not solved with a quiescence scheduler.  - `extensions` — Pi resource wiring. Candidate generation loads the reviewed external Central path once
     through a headless `DefaultResourceLoader` to apply provider registrations, without inspecting it.
     `buildResourceLoader(cwd, settingsManager, getAdmission, excludedPaths, extraFactories?)` then resolves
     Pi's normal settings/package +
@@ -734,12 +968,12 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
     reads in place, then relabels discovered-path provenance after the load — pi's `extensionsOverride` is
     not used because it runs after factories have executed. All other user extensions
     retain normal discovery. The loader then adds
-    automatic **portable cross-agent skill aliases**, then loads the four bundled pi packages — **`pi-web-access`**
-    (`web_search` + `fetch_content`), **`pi-spec-graph`** (the `spec_*`
+    automatic **portable cross-agent skill aliases**, then loads the three bundled pi packages —
+    **`pi-spec-graph`** (the `spec_*`
     tools + its `before_agent_start` rule), **`pi-thinkrail-workflow`** (the workflow-router rule +
     workflow skills), and **`pi-todos`** (the `todo_*` tools + its skill) — and the **ThinkRail extensions
-    from the server registry** ([[submodule-server-extensions]]; today `visualize`, whose server half
-    injects the strict mermaid validator) as named inline extensions. Existing personal aliases are Claude
+    from the server registry** ([[submodule-server-extensions]]; `visualize`, `ask-user-question`, and
+    `web-access` with `pi-web-access`'s tools and `librarian` skill) as named inline extensions. Existing personal aliases are Claude
     (`${CLAUDE_CONFIG_DIR:-~/.claude}/skills`), Codex (`${CODEX_HOME:-~/.codex}/skills`), Copilot
     (`~/.copilot/skills`), and Gemini (`${GEMINI_CLI_HOME:-~}/.gemini/skills`), **plus each installed Claude
     plugin's `skills/` dir** (read from `~/.claude/plugins/installed_plugins.json` — the resolved `installPath`,
@@ -765,7 +999,14 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
     `SkillCatalogEntry.group`), layered with the workspace's per-skill `skillOverrides` (the trust gate is
     checked before the toggle layer, so an "on" override can never un-gate an untrusted alias, and a per-skill
     `on` beats a group disable). `skillsGate` filters + relabels in one `skillsOverride`; only `load` skills
-    reach the system prompt / `/skill:` list.
+    reach the system prompt / `/skill:` list. A **disabled registry extension's** skill roots
+    (`extensionSkillRoots`: source roots in dev, the `extensions/<name>` folder of the staged root when
+    bundled) are left out of `additionalSkillPaths` itself — rebuilt in place from the disabled set
+    snapshotted at each reload — never filtered from pi's result: pi resolves same-name skills first-wins
+    before any override runs, so dropping a winner afterwards would also lose the personal or project skill
+    it shadowed. `listSkillCommands` (whose cache key includes the disabled set) and `listSkillCatalog`
+    build their inputs the same way, so a switched-off extension's skills vanish from Settings → Skills and
+    `/skill:` too. Bundled host skills therefore stage under `host/`, beside `extensions/<name>/`.
     The host resolves the context via the **`setSkillAdmissionResolver`** seam (keyed by `workspaceId`, fails
     closed); `buildResourceLoader` takes the resolver as a thunk and `skillsGate` re-resolves **both** the admission
     context (`getCtx`) **and** the live compatibility source set (fresh discovery) on every `loader.reload()`, so
@@ -795,7 +1036,7 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
       Registry extensions themselves are never path-loaded: they are the same named inline factories in
       both modes (one composition mode; `{ name, factory }` keeps `<inline:visualize>` in diagnostics).
     - **Bundled launchers (compiled CLI binary and packaged desktop runtime):** the launcher awaits the
-      **`registerBundledRuntime({ factories, skillsDir, trashHelpers, webAccessFactory })` seam** before the first session — the same four pi packages as
+      **`registerBundledRuntime({ factories, skillsDir, trashHelpers })` seam** before the first session — the same three pi packages as
       **value-imported default-export factories** (pi gives `extensionFactories` full API parity with path loading; what's lost —
       file-relative `baseDir`, per-reload re-evaluation — none of them use) plus a staged on-disk
       skills dir (pi reads `SKILL.md` via plain fs, so skills must live on the real filesystem; the
@@ -831,12 +1072,28 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
     instance. Together the define and the forced transform are the tested artifact seam (the shared artifact
     probe's synthetic extension value-imports pi and fails closed without them); the `server-runtime.ts`
     filename is only a name.
+    When no Central path is excluded — most installs — pi discovers extensions itself from the
+    (`enabled`-view) settings, the branch every session took before packages were managed. Only an
+    excluded Central path switches the loader to **one host-owned path list** (`noExtensions` +
+    `additionalExtensionPaths`, rebuilt in place from pi's `resolve()` at every reload) so that exact
+    identity can be removed before loading. Both branches wrap `reload()` the same way: apply the
+    current policy (trust, disabled extensions, skill paths, the package policy key) and compare which
+    declared packages were on disk before and after — when pi's install-while-loading fetched one, the
+    packages layer is told (`setInstalledPackagesListener`) so the catalog is invalidated and
+    `packages.changed` published, without bumping the revision, so a reload never triggers another
+    reload. The comparison needs only `listConfiguredPackages()`, not the host-owned list, which is
+    why the fast path could return. *Rejected:* a fingerprint of the resolved package set — it was
+    process-global while `resolve()` output is per cwd, so two workspaces flapped it on alternating
+    reloads, and its first observation had to be suppressed, hiding exactly the first-chat install.
     In every mode, the optional Central artifact remains an external filesystem path loaded by PI's public
     Jiti seam; it is never bundled, staged, or copied into ThinkRail. Both modes append
-    `extensionFactories`: a **headless-search policy** (a `tool_call` hook defaulting
-    `web_search`'s `workflow` to `"none"`, since pi-web-access would otherwise open a browser curator our
-    `rpc` host can't render), `askUserQuestionExtension` (normalizes ask-only assistant batches),
-    `oversizedImageGuard` (the context-level image-size guard, see the `imageGuard` bullet), **and the
+    `extensionFactories`: a **headless-search policy** (`headlessSearch.ts`, a `tool_call` hook defaulting
+    `web_search`'s `workflow` to `"none"`, since pi-web-access would otherwise open a browser curator on
+    the host machine and block on it). It is host-owned and unconditional, never part of the `web-access`
+    extension, because it compensates for the host's UI and must also cover a user's own install of
+    `pi-web-access`, which runs exactly when that extension is switched off;
+    `oversizedImageGuard` (the context-level image-size guard, see the `imageGuard` bullet),
+    `skillCarryover` (see its bullet), **and the
     caller's `extraFactories`** — per-session host bindings (the workspace-bound subagents extension),
     value-imported so dev and the compiled binary take the same path. pi's own built-in extensions
     (`llama.cpp`, `codemode`, `tool-search`, `mcp`) are loaded only by pi's CLI; an SDK host opts in per
@@ -849,18 +1106,21 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
     [MCP servers](#mcp-servers).
     Both session paths pass it as `resourceLoader`. `buildResourceLoader` stays internal; the seam +
     its types are on the barrel.
-- **Public surface (barrel):** the manager operations (incl. `answerQuestion` +
+- **Public surface (barrel):** the manager operations (incl. `respondToTool` +
   `settleSessionsForShutdown`) + `CreateSessionInput`/`CreateSessionResult` + `SessionEventPayload`;
   the runtime-generation facade (`usePiRuntime`, candidate prepare/activate, current generation id, and the
   closed `load-failed` outcome—no manager internals) plus `configurePiRuntime`/factory test seams and the
   pre-bootstrap `configurePiRuntimeGenerationInitializer` composition seam; `listModelContextSettings` /
-  `setModelContextWindow` / `setModelContextPublisher` (the `modelContext` adapter and its
-  `provider.changed` seam); `piLoginOptions` (pi login options
+  `setModelContextWindow` (the `modelContext` adapter); `listCustomEndpoints` / `probeCustomEndpoint` /
+  `saveCustomEndpoint` / `removeCustomEndpoint` (the `customEndpoints` adapter); `setModelsFilePublisher`
+  (their shared `provider.changed` seam); `piLoginOptions` (pi login options
   carrying the lazily created installation device id, for `auth`);
   `completeOnce`/`pickModel` +
-  `OneShotRequest`/`OneShotResult`/`ModelTier`; the `webUiContext` seams; the `askUserQuestion` pure
-  helpers (`validateQuestionnaire`/`buildQuestionnaireResponse`/`assessAnswerability`/
-  `buildAnswersMessage`/`awaitingQuestionToolCallId`); normalized-state operations
+  `OneShotRequest`/`OneShotResult`/`ModelTier`; the `webUiContext` seams (including `publishSessionNotice`);
+  `recheckAnthropicExtraUsage` / `disableAnthropicExtraUsageWarning` / `globalProviderWarnings` (see
+  Billing warnings); the `toolResponses` mailbox
+  and pure helpers (`createToolResponseWaiters`/`toolResponseSessionServices`/`assessRespondability`/
+  `describeToolResponse`/`buildToolResponseMessage`/`awaitingToolCallId`); normalized-state operations
   (`listSessionStates`/`acknowledgeCompletion`/`markWorkspaceUnread`/`markWorkspaceRead`/`nudgeSession` +
   publisher/project seams);
   `repairDanglingToolCalls`; `liveParentContext` + `readChildTranscript`
@@ -904,7 +1164,11 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
   set; this module owns compose-time filtering and live activation timing);
   the `set_title` seam (`setTitleToolHost` + `TitleToolHost`/`SET_TITLE_TOOL_NAME`/`SetTitleParams`);
   the bundled-artifact seam (`registerBundledRuntime` +
-  `BundledExtensions`/`BundledExtensionFactory`).
+  `BundledExtensions`/`BundledExtensionFactory`). The publishers, resolvers and handlers above that
+  `createServer` installs return to their module default at its `stop()` — no-op publishers and, via
+  `null`, the default resolver policy, no concurrency resolver, and the unavailable `request_review` /
+  `resolve_comment` / `set_title` handlers. The PI runtime, its factories, the session manager factory
+  and `registerBundledRuntime` are not reset by `stop()`; whoever configures them restores them.
 - **Allowed deps:** `@earendil-works/pi-coding-agent` (runtime); `@earendil-works/pi-ai` (types + test
   fixtures + **pure catalog helpers value-imported from the package root** — today exactly
   `getSupportedThinkingLevels` + `clampThinkingLevel`, data-only projections over `Model`; *dispatch*
@@ -912,14 +1176,14 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
   + `/compat` subpaths, value-imported **only** inside `registerBundledRuntime`'s dynamic imports);
   `pi-delegation` + `pi-subagents` (the portable delegation runtime and Agent-tool composition,
   value-imported by the host embedding); `pi-background-commands` (the session-bound command
-  capability, likewise value-imported by its host embedding); `pi-web-access` + `pi-spec-graph` +
+  capability, likewise value-imported by its host embedding); `pi-spec-graph` +
   `pi-thinkrail-workflow` + `pi-todos` (the bundled pi packages — parent sessions load the set through
-  resource-loader paths or launcher factories; delegated children value-import `pi-spec-graph` and receive
-  the named `pi-web-access` factory through the bundled runtime seam; the source-mode equivalent loads it
-  lazily through `jiti` — the loader pi uses for extension paths — so a parent never pays for it and the
-  barrel stays Node-loadable for the workflow harness ([[module-workflow-tests]])); the sibling `extensions` registry module (the ThinkRail extensions' inline factories and
-  skill roots — `agent` never imports an `@thinkrail/ext-*` package or its pi package directly); `jiti` (the source-mode child `pi-web-access` load above); `typebox` (the `ask_user_question` parameter schema); `jsonc-parser` (targeted
-  `models.json` edits in `modelContext`); `trash` (reached only through the
+  resource-loader paths or launcher factories; delegated children value-import `pi-spec-graph`); the sibling `extensions` registry module (the ThinkRail extensions' inline factories and
+  skill roots — `agent` never imports an `@thinkrail/ext-*` package or its pi package directly; the barrel
+  stays Node-loadable for the workflow harness ([[module-workflow-tests]]) because a registry extension
+  over raw third-party `.ts` loads it lazily, see [[module-ext-web-access]]); `typebox` (the host tools' parameter schemas); `jsonc-parser` (targeted
+  `models.json` edits in `modelsFile`, `modelContext` and `customEndpoints`); global `fetch` (only
+  `customEndpoints`' user-initiated probes of the address the user typed); `trash` (reached only through the
   sibling **`trash` module** — see [[submodule-server-trash]]: one path, globbing disabled, allowed to
   throw, never degraded to `unlink`; the launcher's staged-helper and procfs-parser seams live there too,
   because `changes`' whole-file revert needs the same primitive);
@@ -931,6 +1195,76 @@ answer-injection path, and the **restart repair** that keeps re-opened transcrip
   worktree `cwd` remains an input, never a workspace-registry lookup); Central process/filesystem knowledge—the
   caller supplies only the desired opaque extension paths for a candidate.
 
+## Tool output and context recovery
+
+Portable tools own bounded model-facing output ([[submodule-spec-graph-tools]],
+[[submodule-pi-todos-tools]]); the host does not wrap every tool or rewrite user input. Pi's native
+read/bash/MCP limits remain authoritative. Structured result details are presentation metadata;
+measure model-facing content, not the serialized transcript or SDK context object.
+
+Pi owns aggregate budgeting, compaction and recovery; bounded tool output does not guarantee
+whole-request admission. The host adds no compaction overrides or retry loop. Known upstream
+context-budget limitations and their upgrade checks live in [[pi-compatibility]].
+
+## Provider stream framing
+
+Pi owns provider retry; the host never adds one. Pi retries only errors that match its retryable
+patterns: "Anthropic stream ended before message_stop" does, "Could not parse Anthropic SSE event" does
+not. `patches/@earendil-works%2Fpi-ai@1.5.0.patch` (root `patchedDependencies`, upstream
+earendil-works/pi#10390, #564) fixes two defects in pi-ai's `anthropic-messages` SSE parser that end a
+turn with that parse error. The two fixes have different outcomes:
+
+- **Split CRLF.** A `\r\n` after an `event:` line, split across two network chunks, read as two line
+  breaks. The blank line dispatched the event without its `data:` line, so a complete, valid CRLF stream
+  failed. A trailing `\r` now waits for the next chunk, and the stream succeeds. The final drain still
+  ends a line on a lone `\r`.
+- **Cut-off stream.** The event that a cut left without its blank line was dispatched with empty or
+  partial data. It is now parsed strictly, never "repaired", and dropped when empty, unparsable or not an
+  object, so the cut ends with a retryable truncation error such as "stream ended before message_stop".
+  An unfinished event that does parse is still yielded, so a stream missing the final blank line after
+  `message_stop` still succeeds.
+
+A finished but malformed event keeps the non-retryable parse error. Observed failures carry an empty
+`data=` and only the `event:` line in `raw=`. A split CRLF always leaves that signature and a random cut
+rarely does, so the split CRLF is likely what users hit. Unconfirmed: whether api.anthropic.com or a
+proxy on the path sends CRLF. The guard test and removal gate live in [[pi-compatibility]].
+
+## Billing warnings
+
+The host owns the warning that pi's interactive mode shows: Claude Pro/Max auth (OAuth) bills
+third-party-harness usage as Anthropic extra usage, per token. So does an `sk-ant-oat` subscription
+token used as an API key. `anthropicExtraUsage.ts` decides with pi's public auth reads:
+`checkAuth("anthropic").type === "oauth"`, otherwise `getAuth` returns an `apiKey` with the
+subscription prefix. A failed lookup means no warning. The check is gated on the session's
+`settingsManager.getWarnings().anthropicExtraUsage !== false`, which is pi's own setting, default on,
+shared with the pi CLI. There is no ThinkRail copy of the setting.
+
+- **Once per session per host run.** The entry's `extraUsageWarned` flag is set only after the async
+  check passes, the entry is still registered with the same provider, and the setting is *still* on.
+  That final setting check reads pi's settings **from disk** (the session's cwd and trust), not the
+  session's in-memory `SettingsManager`. A manager loaded before an opt-out would still say "on":
+  a chat mid-create or mid-attach when another client clicks Don't warn again, or a lookup still in
+  flight. A concurrent re-check cannot double-warn, and the opt-out always wins.
+- **Triggers mirror pi's:** `registerSession` (create and attach), pi's `model_select` extension event,
+  and `recheckAnthropicExtraUsage` after a successful Anthropic login in `auth`. A per-session inline
+  extension (`extraUsageModelSelectExtension`) listens for `model_select`. It therefore covers the
+  host's `setSessionModel` and an extension's `pi.setModel` or a model cycle alike; a
+  host-wrapper-only hook would miss the last two.
+- **Central-replaced `anthropic`** is skipped (`opaqueProviderIds`): its credential is Central's and is
+  never read.
+- **Delivery** is a `notice` frame on the ExtUi channel (`publishSessionNotice`). It carries a closed
+  code, never text, so the web localizes it. The web replays it like `notify`, so a push that beats
+  `session.create`'s response survives. A reload before dismissal loses it, like pi's transient line.
+- **Don't warn again** (`provider.disableWarning`): `disableAnthropicExtraUsageWarning` writes pi's
+  *global* `warnings.anthropicExtraUsage = false` (other global warnings are kept) and flushes. Live
+  sessions need no reload, because the publish-time disk read sees it. Re-enabling is pi's
+  `/settings` or `settings.json`; ThinkRail has no switch by design. `globalProviderWarnings()` feeds
+  `ProviderStatusReport.warnings`, which gates the sign-in dialog notice. Both global helpers open pi's
+  `SettingsManager` with `projectTrusted: false`. Otherwise a malformed `.pi/settings.json` in the
+  host's cwd would surface through `drainErrors()` and fail a global write that actually succeeded.
+
+The parity entry and its removal gate live in [[pi-compatibility]].
+
 ## Session titles
 
 `agentSessionManager` is the only durable chat-title writer. Its `renameSession(sessionId,
@@ -940,6 +1274,15 @@ normalized title is already current. A live session writes through `AgentSession
 session opens its exact transcript with `SessionManager.open(...).appendSessionInfo(...)` without attaching an
 agent or resolving a model. Both paths publish the same `session_info_changed` Pi event, while
 `SessionSummary.title` remains the hydration projection.
+
+**The name rides the state record.** Every `SessionStateRecord` the manager builds carries `title`: a live
+entry reads `AgentSession.sessionName`, and it is part of `publishEntryState`'s dedupe key, so the publish
+that follows every registered-session event — a rename's `session_info_changed` included — pushes the new
+name; a disk row reads the manager the collector has just opened (not the listing's `SessionInfo.name`,
+which an awaited discovery can leave older than the transcript read beside it), and a disk-only rename
+publishes that chat's complete record (`diskStateRecord`, state + title + first prompt) after its event.
+`""` means unnamed. It costs no transcript read — the collector and the rename already hold the manager —
+and the name is read as pi stores it, never re-validated by the write rule.
 
 The guarded write remains authoritative across the async race. `onlyIfUnnamed` performs the check immediately
 beside the append and is the compare-and-set the `set_title` handler uses (its `false` return is how the
@@ -969,14 +1312,37 @@ live session context, effective shell settings and lifecycle in source and packa
 first version loads this capability into parent chats only, not the curated hidden-child extension
 set; ordinary child Bash remains visible in its transcript.
 
-A small agent-barrel facade serves the resource snapshot, command output/stop and subagent
-stop/stop-all operations defined in [[module-contracts]]. It projects command services plus
-`DelegationService.childrenOf(parent)`; no aggregate registry owns copies of their lifecycles.
-Subagent summaries include direct foreground and background children and omit handles with no run
-snapshot yet. Keep all active children and the latest twenty terminal children by record creation order,
-without disposing older handles or transcripts. Task and role summaries are capped at 2,000 and 200
+A small agent-barrel facade serves the resource snapshot, history pages, command output/stop and
+subagent stop/stop-all operations defined in [[module-contracts]]. Live rows come from the command
+services plus `DelegationService.childrenOf(parent)`; no aggregate registry owns copies of their
+lifecycles. Finished rows come from [[submodule-server-resource-history]], merged with whatever the
+owners still hold — an owner's own terminal record wins over an archived in-flight one, so a failed
+archive write never turns finished work into Interrupted. The snapshot carries every live record plus
+the newest twenty finished per kind and the per-kind outcome tallies; older ones page through
+`session.resourceHistory`, and `backgroundCommand.output` falls back to the archived log tail once the
+owner has evicted or lost the command. Subagent summaries include direct foreground and background
+children (the plan reviewer too) and omit handles with no run snapshot yet; older handles and
+transcripts are never disposed for the window. Task and role summaries are capped at 2,000 and 200
 characters. One lifecycle subscription per workspace service and each command service's change subscription
 publish scoped invalidations through a host-injected publisher; no per-token/output broadcast is added.
+
+The same subscriptions feed the archive synchronously: command admission, stop request and terminal edges
+(with the retained log tail), subagent queued/started/terminal edges (with the terminal time). A command's
+archive subscription outlives the manager's own and closes only once the command service's disposal settles
+(or its budget expires), so the terminal edges that teardown itself causes are still recorded. A failed
+archive write is logged and never retried for the same status; the owner's record still wins while it lives. **Interrupted** is decided here, once:
+a command that ends `stopped` while its chat's resources are closing, without a stop requested before
+the closing began, is archived `interrupted`, and so is a command still unsettled when the cascade gives
+up (in flight, with its log so far). For subagents the closing cascade marks its own cancellation: before
+`disposeChildrenOf` it aborts every child with the reason `interrupted`, and since [[module-pi-delegation]]
+keeps a run's first cancellation reason, only a run that teardown cancelled first is archived `interrupted`.
+A run already cancelled when teardown lands keeps its own provenance and reads Stopped — a user stop
+(`"user"`) as well as a foreground child the parent's own Stop cancelled through its tool signal, which
+carries no reason (an AIR review finding on PR #1004: inferring teardown from a missing reason mislabelled
+exactly that run). A user or tool stop that merely settles during teardown stays Stopped. Interrupted work is shown to the user only: it never wakes the parent and nothing tells the
+agent its acknowledged run is gone (user-settled, 2026-10). Work a dead host left in flight is the archive's own derivation. Workspace archive removes the
+workspace's history after its delegation store; late lifecycle events of a retired delegation service are not
+archived, so they cannot recreate it. Chat deletion leaves the history in place.
 
 Each operation validates actual workspace/session membership, child lineage and the manager's deletion
 gate before touching a handle. Persisted parents use the existing single-flighted attachment path;
@@ -1148,7 +1514,7 @@ the `/mcp` command stay pi's; ThinkRail owns what a multi-session GUI host owes 
   never runs there) and is not reconciled unless an earlier failed MCP reload remains retryable.
   Reconciliation runs after every
   host mutation, when the user file changes (`watchUserMcpConfig`: one directory watcher on pi's agent dir,
-  300 ms debounce; a missing agent dir is created first — pi creates it on first use anyway — so a file the
+  300 ms debounce, which also dispatches `settings.json` edits to the pi packages layer (`piPackages`); a missing agent dir is created first — pi creates it on first use anyway — so a file the
   user adds later is still seen; a rename or watcher error retires the old watch and rearms it with
   capped retry backoff, including after the agent directory is recreated; stopping cancels retries), when a workspace change nudge touches `.pi`, and at each session's
   `agent_settled` (so an edit the agent made itself applies once the run ends); a deferred reload shows the
@@ -1164,7 +1530,7 @@ the `/mcp` command stay pi's; ThinkRail owns what a multi-session GUI host owes 
   the marker and restarts status. Closing or disposed entries neither report failures nor restart.
   Reloads go through `session.reload()` behind a per-session reload gate: while a reload runs, every
   admission seam (`promptSession`, `steerSession`, `followUpSession`, `nudgeSession`, queue requeues,
-  `answerQuestion`, `sendReviewFixToSession`, `compactSession`) refuses with "reloading", and completion
+  `respondToTool`, `sendReviewFixToSession`, `compactSession`) refuses with "reloading", and completion
   delivery waits in its owners through `canDeliverCompletion` and flushes afterwards; the gate opens only
   when pi is `isIdle`, no admitted prompt is still in preflight (the host reserves the window from
   admission to `agent_start` — pi ≤ 1.1 reported idle throughout it and pi 1.2 still does until
@@ -1269,10 +1635,11 @@ the `/mcp` command stay pi's; ThinkRail owns what a multi-session GUI host owes 
 - **A re-opened disk session is repaired before it is seeded** (`repairDanglingToolCalls` between
   `SessionManager.open` and `createAgentSession`) — never append to a session file behind a live
   `AgentSession`, its in-memory context would desync.
-- **A live ask blocks only in its session-bound phase registry; restart state stays transcript-derived.**
-  The registry is forgotten on disposal and never restored. Only a tool-executable dangling ask is repaired
-  to ack before attach; `length`/`error`/`aborted` attempts are terminal. `assessAnswerability` remains the
-  one reply-validity authority; rejections fail the WS request loud.
+- **A live interactive call blocks only in its session-bound phase registry; restart state stays
+  transcript-derived.** The registry is forgotten on disposal and never restored. Only a tool-executable
+  dangling call of an enabled interactive tool is repaired to the pending marker before attach;
+  `length`/`error`/`aborted` attempts are terminal. `assessRespondability` remains the one reply-validity
+  authority; rejections fail the WS request loud.
 - Share one **current** `ModelRuntime` for pre-session reads and new sessions. Every session receives and
   retains its generation as `createAgentSession`'s `modelRuntime`; give each its own `SessionManager` and
   `dispose()` it on removal. Old runtimes remain reachable only through old live sessions and become

@@ -90,11 +90,11 @@ another.
    define a single-file bundle is treated as a plain Node runtime and PI's lazy Babel `require` cannot resolve
    inside it ([[submodule-server-agent]] owns the seam). Flattening PI into Electrobun's normal entry is still
    forbidden: it would load `bun-pty` before `BUN_PTY_LIB` is set.
-4. The runtime value-imports the four bundled pi-package factories (`pi-web-access`, `pi-spec-graph`,
+4. The runtime value-imports the three bundled pi-package factories (`pi-spec-graph`,
    `pi-thinkrail-workflow`, `pi-todos`) and calls `registerBundledRuntime()` with those factories, the
-   `pi-web-access` factory needed by delegation children (picked by `BuildRuntimeSources.webAccessIndex`,
-   never by position), the staged skills (every `BuildRuntimeSources.skillRoots` entry flattened into one
-   dir, duplicate routes rejected), and macOS/Windows trash helpers. ThinkRail extensions from the server
+   staged skills (every `BuildRuntimeSources.skillRoots` entry copied into one dir under its `route` —
+   host roots under `host/`, a registry extension's under `extensions/<name>/` — duplicate routes rejected), and
+   macOS/Windows trash helpers. ThinkRail extensions from the server
    registry ([[submodule-server-extensions]]) need no generated entry: their factories reach the bundle
    through `@thinkrail/server`'s static import graph. The generator's key map must satisfy every key of the server-owned
    `BundledExtensions` contract, so adding a required launcher field fails desktop typecheck instead of
@@ -324,12 +324,37 @@ twice.
 ## Navigation and window security
 
 The native window permits navigation only within its exact loopback origin. User-requested external URLs
-open through the OS instead of replacing the app surface. Navigation listeners use the SDK emitter's
-webview-scoped `will-navigate-<id>` and `new-window-open-<id>` channels; the unscoped payload has no
-webview id, and the instance listener's typed event list omits popups. Payload types are derived from
-SDK event factories, not copied into local declarations. Detail can be a raw URL, a popup object, or
-serialized navigation JSON; bounded decoding retains only a string URL and the HTTP/HTTPS/mailto
-allowlist. Native `navigationRules` enforce confinement: navigation-event responses cannot cancel it.
+open through the OS exactly once instead of replacing the app surface. Native navigation rules enforce
+confinement: navigation-event responses cannot cancel it. The launcher applies them with
+`webview.setNavigationRules` right after creating the window: block everything, then allow the origin,
+`about:srcdoc`, and same-origin `blob:`. HTML, SVG and notebook previews update `srcDoc` in place and
+every srcdoc load is policy-checked, so blocking `about:srcdoc` blanks them; `blob:` keeps downloads
+working. Electrobun 2.0.5 documents a `navigationRules` constructor option but never forwards it to
+native code, so the launcher does not use it.
+
+Every external link activation reaches the OS through one path. The desktop preload turns unmodified
+primary and middle clicks on external links, whatever their `target`, and `window.open` of external URLs
+into a same-window navigation. The rules cancel it, and the native layer reports it once through
+`will-navigate` on every platform. The per-platform new-window paths are unusable. On macOS, a `_blank`
+click that passes the policy check produces both `will-navigate` and `new-window-open`. WebKitGTK and
+WebView2 report nothing for `_blank` or `window.open`, because Electrobun handles neither
+`NEW_WINDOW_ACTION` nor `NewWindowRequested` (the WebView2 half is
+[electrobun#569](https://github.com/blackboardsh/electrobun/issues/569)). Cmd/Ctrl-click keeps
+Electrobun's own preload path, which emits `new-window-open`. Clicks the page already handled, `download`
+links, same-origin URLs, and schemes outside the allowlist below stay with the page. An Electrobun
+upgrade must re-check both gaps. Once the constructor option reaches native code, the explicit call
+becomes redundant. Once every renderer reports and cancels new-window requests, the preload routing can
+go. On Windows a cancelled navigation may still send its GET request (WebView2's documented behaviour); the
+window stays on its page and never commits the URL. Post-mortem: before the rules were applied explicitly,
+every navigation was allowed. A non-`_blank`
+external navigation replaced the app with the external page, which then also received the desktop
+preload bridge, and macOS opened `_blank` links twice.
+
+Navigation listeners use the SDK emitter's webview-scoped `will-navigate-<id>` and `new-window-open-<id>`
+channels; the unscoped payload has no webview id, and the instance listener's typed event list omits
+popups. Payload types are derived from SDK event factories, not copied into local declarations. Detail
+can be a raw URL, a popup object, or serialized navigation JSON; bounded decoding retains only a string
+URL and the HTTP/HTTPS/mailto allowlist, which the preload routing reuses.
 
 A desktop preload sends typed, one-way route, local-preference, page-zoom, and title-bar double-click
 messages, and is the only writer of the window-chrome CSS properties described above. It wraps
@@ -370,8 +395,10 @@ Abrupt death relies only on operating-system process cleanup.
 
 Artifact tests drive this same entrypoint through opt-in environment/ready/control seams: isolated user
 data, a hidden neutral window for browser-backed tests, host/launcher ids and origin on DOM-ready, and
-normal quit. Native UI smoke can capture an external-open result and request one fixed navigation probe
-instead of launching the user's browser. With a title-bar probe file, two control commands dispatch
+normal quit. Native UI smoke records every external open instead of launching the user's browser, plus
+each `will-navigate` verdict and main-frame commit, in the navigation probe file. It
+also requests navigation probes aimed at a test-supplied cross-origin loopback origin: a scripted
+navigation, a plain link, a `_blank` link, `window.open`, and an in-place `srcdoc` update. With a title-bar probe file, two control commands dispatch
 synthetic `dblclick`s in the live webview: `title-bar-double-click` on the header, and
 `title-bar-double-click-no-drag` on the no-drag action cluster followed by the header in one task. The
 launcher records how many double-click messages it received and handled, plus the last handled
@@ -432,7 +459,11 @@ three gaps, closed by the project:
   `postBuild` closes both gaps. It rewrites the resources of `bin/bun.exe`, `bin/launcher.exe` and
   `Resources/uninstall`: every icon entry is replaced by one group 1 with all frames, and VERSIONINFO
   comes from [[module-shared]]'s `windowsFileIdentity`. Rewriting drops `bun.exe`'s now-invalid Oven
-  certificate entry; release signing covers every PE afterwards ([[module-ci-release]]).
+  certificate entry; release signing covers every PE afterwards ([[module-ci-release]]). Hutch's Win32
+  resource update already drops the signature bytes but keeps their directory entry, which then points
+  past end of file. Branding therefore clears the entry and cuts any signature bytes before parsing,
+  rather than relying on the PE library's signed-file bypass, which still reads to that offset. Windows
+  PR CI builds and smokes the desktop app, so a branding defect fails the PR ([[module-ci-release]]).
 - **Window icon.** Electrobun registers its window class without an icon, never sends `WM_SETICON`, and
   its Windows `setWindowIcon` is a stub. Startup therefore loads `Resources/app.ico` (Hutch's copy of the
   ICO) through `user32` and sends it to the splash and the main window, sized for the window's DPI. A

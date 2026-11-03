@@ -1,8 +1,9 @@
 import { RiArrowDownLine as ArrowDown, RiArrowUpLine as ArrowUp } from "@remixicon/react";
-import type { AskUserQuestionResult, GitDiffScope, TurnChangeSet } from "@thinkrail/contracts";
+import type { GitDiffScope, TurnChangeSet } from "@thinkrail/contracts";
 import type { MessageKey } from "@thinkrail/locales";
 import { t as translate, useT } from "@thinkrail/locales/react";
 import { ResourceScopeProvider } from "@thinkrail/resource-renderers";
+import { Button } from "@thinkrail/ui/button";
 import { useModalLayerOpen } from "@thinkrail/ui/dialog";
 import { cn } from "@thinkrail/ui/utils";
 import {
@@ -27,13 +28,17 @@ import {
 	toast,
 	useAppStore,
 } from "@/store";
-import { getTransport } from "@/transport";
+import { getTransport, respondToTool } from "@/transport";
 import { ACTIVITY_BREADCRUMB_HEIGHT, ActivityBreadcrumbTrail } from "./activityBreadcrumbs";
-import { AskStatesContext, deriveAskStates } from "./askState";
 import { type ChatActions, ChatActionsContext } from "./ChatActions";
 import type { ChatMessageOrder } from "./chatPreferences";
 import { type PendingExtUi, PendingExtUiContext, PendingExtUiPrompt } from "./ExtUiPrompt";
 import { FoldGeometryProvider } from "./foldState";
+import {
+	awaitingToolCallIdOf,
+	deriveInteractionStates,
+	InteractionStatesContext,
+} from "./interactionState";
 import { deriveMessageActions } from "./messageActions";
 import { turnAnchorText } from "./recentPrompts";
 import { estimateChatRowHeights } from "./rowHeightEstimates";
@@ -217,7 +222,7 @@ const ChatTranscript = forwardRef<
 				isStreaming: rt.isStreaming,
 				settlementTick: rt.settlementTick,
 				currentAssistantId: rt.currentAssistantId,
-				askAnswers: rt.askAnswers,
+				toolResponses: rt.toolResponses,
 				hostState: rt.hostState,
 				turnIdByMessageIndex: rt.turnIdByMessageIndex,
 				syncedConnectionGeneration: rt.syncedConnectionGeneration,
@@ -409,7 +414,7 @@ const ChatTranscript = forwardRef<
 			streamEdgeRef,
 		],
 	);
-	const [askFocusScope] = useState<object>(() => ({}));
+	const [interactionFocusScope] = useState<object>(() => ({}));
 
 	const chatLocationRequest = useAppStore((s) => s.chatLocationRequest);
 	const activeChatLocationReveal = useRef<typeof chatLocationRequest>(null);
@@ -559,24 +564,23 @@ const ChatTranscript = forwardRef<
 	const promptOnToolCard =
 		anchorToolCallId !== undefined && rowsHaveToolCall(chronologicalRows, anchorToolCallId);
 
-	const askStates = useMemo(
-		() => deriveAskStates(runtime.turns, runtime.askAnswers, runtime.toolResults),
-		[runtime.turns, runtime.askAnswers, runtime.toolResults],
+	const interactionStates = useMemo(
+		() => deriveInteractionStates(runtime.turns, runtime.toolResponses, runtime.toolResults),
+		[runtime.turns, runtime.toolResponses, runtime.toolResults],
 	);
-	const askContext = useMemo(
-		() => ({ states: askStates, focusScope: askFocusScope }),
-		[askStates, askFocusScope],
+	const awaitingToolCallId = awaitingToolCallIdOf(runtime.hostState);
+	const interactionContext = useMemo(
+		() => ({ states: interactionStates, focusScope: interactionFocusScope, awaitingToolCallId }),
+		[interactionStates, interactionFocusScope, awaitingToolCallId],
 	);
 
 	const chatActions = useMemo<ChatActions>(
 		() => ({
-			answerQuestion: (toolCallId: string, result: AskUserQuestionResult) =>
-				getTransport()
-					.request("session.answerQuestion", { sessionId, toolCallId, result })
-					.then(() => undefined),
 			cancelAutomaticReveal,
 			focusComposer,
 			openSubagentTranscript,
+			respondToTool: (toolCallId: string, response: unknown) =>
+				respondToTool(sessionId, toolCallId, response),
 			resultOpener,
 			markResultSeen,
 			revealChatElement: revealElement,
@@ -604,7 +608,7 @@ const ChatTranscript = forwardRef<
 	return (
 		<ChatActionsContext.Provider value={chatActions}>
 			<PendingExtUiContext.Provider value={pendingExtUi}>
-				<AskStatesContext.Provider value={askContext}>
+				<InteractionStatesContext.Provider value={interactionContext}>
 					<div
 						data-testid="chat-scroll"
 						data-follow-state={followState}
@@ -712,21 +716,18 @@ const ChatTranscript = forwardRef<
 							/>
 						</div>
 						{showScrollButton ? (
-							<button
-								type="button"
+							<Button
+								variant="outline"
+								size="m"
+								iconLeft={chatMessageOrder === "newest-first" ? ArrowUp : ArrowDown}
 								data-testid={
 									chatMessageOrder === "newest-first" ? "scroll-to-top" : "scroll-to-bottom"
 								}
 								onClick={scrollToLatest}
-								className="-translate-x-1/2 absolute bottom-12 left-1/2 flex items-center gap-4 rounded-sm border border-border-default bg-container-elevated-bg px-8 py-4 text-text-muted tr-text-metadata shadow-[var(--shadow-md)] hover:bg-control-bg-hovered hover:text-text-default"
+								className="-translate-x-1/2 absolute bottom-12 left-1/2 shadow-[var(--shadow-md)]"
 							>
-								{chatMessageOrder === "newest-first" ? (
-									<ArrowUp className="size-12" />
-								) : (
-									<ArrowDown className="size-12" />
-								)}
 								{scrollButtonLabel ? t(SCROLL_BUTTON_LABELS[scrollButtonLabel]) : null}
-							</button>
+							</Button>
 						) : null}
 						<span
 							role="status"
@@ -749,7 +750,7 @@ const ChatTranscript = forwardRef<
 						) : null}
 						{resourcesOverlay}
 					</div>
-				</AskStatesContext.Provider>
+				</InteractionStatesContext.Provider>
 			</PendingExtUiContext.Provider>
 		</ChatActionsContext.Provider>
 	);

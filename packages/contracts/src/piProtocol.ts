@@ -16,7 +16,7 @@ export type {
 
 import type { AgentEvent, AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Message, Model, StopReason, TextContent } from "@earendil-works/pi-ai";
-import type { ProviderAuthKind } from "./domain";
+import type { ProviderAuthKind, ProviderWarning } from "./domain";
 
 const NON_EXECUTABLE_TOOL_CALL_STOP_REASONS: ReadonlySet<string> = new Set([
 	"error",
@@ -65,10 +65,10 @@ export interface AgentSettlement {
 	errorMessage?: string;
 }
 
-export type SessionInputKind = "question" | "dialog";
+export type SessionInputKind = "tool-response" | "dialog";
 
 export type SessionInputState =
-	| { interactionId: string; kind: "question" }
+	| { interactionId: string; kind: "tool-response"; toolCallId: string }
 	| {
 			interactionId: string;
 			kind: "dialog";
@@ -292,6 +292,7 @@ export type ExtUiRequest =
 	| { id: string; sessionId: string; kind: "setStatus"; key: string; text: string | null }
 	| { id: string; sessionId: string; kind: "setWidget"; key: string; content: string[] | null }
 	| { id: string; sessionId: string; kind: "setTitle"; title: string }
+	| { id: string; sessionId: string; kind: "notice"; notice: ProviderWarning }
 	| { id: string; sessionId: string; kind: "dismiss" };
 
 export interface ExtUiResponse {
@@ -299,46 +300,13 @@ export interface ExtUiResponse {
 	value: string | boolean | null;
 }
 
-export interface AskUserQuestionOption {
-	label: string;
-	description: string;
-	preview?: string;
-	recommendedReason?: string;
-}
-
-export interface AskUserQuestionItem {
-	question: string;
-	header: string;
-	options: AskUserQuestionOption[];
-	multiSelect?: boolean;
-}
-
-export interface AskUserQuestionArgs {
-	questions: AskUserQuestionItem[];
-}
-
-export interface AskUserQuestionAnswer {
-	questionIndex: number;
-	question: string;
-	kind: "option" | "custom" | "multi";
-	answer: string | null;
-	selected?: string[];
-	notes?: string;
-	preview?: string;
-}
-
-export interface AskUserQuestionResult {
-	answers: AskUserQuestionAnswer[];
-	cancelled: boolean;
-}
-
-export interface AskUserQuestionAckDetails {
+export interface ToolResponsePendingDetails {
 	kind: "ack";
 }
 
-export interface AskUserAnswersDetails {
+export interface ToolResponseDetails {
 	toolCallId: string;
-	result: AskUserQuestionResult;
+	response: unknown;
 }
 
 export interface WireCustomMessage<T = unknown> {

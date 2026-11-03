@@ -72,7 +72,10 @@ blocks in order into rows; `ChatTurnView` dispatches on row kind:
   summarization"). **`ErrorTurn`** is a persistent failure notice
   (provider/model error, an unrecovered `length` truncation, or a rejected send), drawn in the shared
   [[web-notices]] style: neutral fill, error border and icon, **Try again** in a footer row. It is **never folded**, so
-  a failed turn can't look like nothing happened. Only the current settlement-derived failure carries the
+  a failed turn can't look like nothing happened. A provider error that matches a known
+  model-unavailable signature (`model_not_found`, Anthropic's `not_found_error` on `model:`, OpenRouter's
+  `No endpoints found`, Bedrock's model access denial, …) leads with a localized "pick another model"
+  notice above the provider's verbatim text, since these are account/plan limits a retry cannot fix. Only the current settlement-derived failure carries the
   web-local `try-again` recovery action; its **Try again** button sends one visible ordinary `Try again.` user
   message through `ChatView`'s existing immediate-send path. Rejected sends, extension notifications, and
   generic app errors stay non-actionable because the missing prompt or repair may not be in Pi's context.
@@ -230,8 +233,8 @@ blocks in order into rows; `ChatTurnView` dispatches on row kind:
   unexplained box. Expanding shows the bounded excerpt (escaped plain text, wrapped, natural height, no
   inner scroll) or the report Markdown without pi-subagents' `Subagent "x" (id) status:` header. The open
   action comes from `ChatActions.resultOpener`: `ChatView` opens the Resources inspector at that row while
-  the snapshot holds it, a subagent that left the in-memory registry (host restart, older than the latest
-  twenty) falls back to the transcript dialog, and a command has no fallback (no action). A row whose
+  the client holds it (the snapshot's window or a page loaded past it), a subagent it does not hold falls
+  back to the transcript dialog, and a command has no fallback (no action). A row whose
   details carry a `delivery` marker leads with whether the agent received it ("Agent received") or will
   react with the user's next message (`appended`); expanding or opening it marks the result seen
   through `ChatActions.markResultSeen`. The rows never infer current resource authority. Never folded
@@ -311,7 +314,7 @@ rows, `ToolCard`, the divider's multi-artifact chips) records manual toggles in 
 (`foldState.ts`, keyed by row/step id. Two hooks over that module: **`useFold`** for independent booleans,
 and **`useSelection`** for a single-choice group — the divider's chips, which store the *selected key* under
 `${rowId}:artifacts` rather than a boolean per side, so "only one list open" cannot be violated;
-the `AskUserQuestionCard` pattern, see tools/SPEC.md; deliberately
+the `AskUserQuestionCard` pattern, see [[module-ext-ask-user-question]]; deliberately
 never evicted — growth is bounded by manual toggles). A manual toggle always wins — over auto-expand
 defaults *and* over a virtualization remount. `FoldGeometryProvider` is the transcript's explicit pre/post
 change seam: every fold header registers a stable row-derived id through `useFold`, including `Collapsible`
@@ -367,7 +370,10 @@ entry/exit obeys reduced motion.
 the **capability** registers with the pi session server-side (custom tool or pi extension/skill), the
 **presentation** registers here. The registry `Map` and fallback renderer stay app-local;
 `extensions/registerWebExtensions()` feeds the ordered descriptors from `extensions/registry.ts`
-into it when `ChatView` loads. Built-in app renderers retain their local side-effect registrations.
+into it at app bootstrap (`main.tsx`), before any lazy view loads: the plan and review panes derive
+interaction state from the registry's `interactive` registrations, so the registry must be complete before
+the first transcript is read, not only once the chat view mounts. Built-in app renderers retain their local
+side-effect registrations (`tools/register`, loaded with `ChatView`).
 Render contracts (`ToolRenderProps`, `ToolStatus`, registration metadata) and pure argument/result
 helpers come from `@thinkrail/extension-api/web`, not chat internals. `Markdown` imports the named
 `MermaidView` from `@thinkrail/ext-visualize/web` for fenced mermaid; shiki and highlighted `CodeBlock`
@@ -393,20 +399,35 @@ name, else the longest app-local prefix registration (`registerToolRendererPrefi
 because pi names MCP tools per server), else the default. Exact names always win, an empty prefix never
 matches, and extension descriptors stay exact-name only.
 
-Unregistered tools fall back to `DefaultToolRenderer`. Tools needing user input mid-run either route
-through the extension-UI bridge (`pi.extensionUi` → `ExtUiPrompt`, below) or — for a rich inline card —
-render from their `toolCall` args and reply through **`ChatActions`** (see below). Worked example: the
-`ask_user_question` flow in [tools/SPEC.md](tools/SPEC.md).
+Unregistered tools fall back to `DefaultToolRenderer`. A tool that needs user input mid-run takes one of
+two routes:
+- the extension-UI bridge (`pi.extensionUi` → `ExtUiPrompt`, below);
+- for a rich inline card, rendering from its `toolCall` args and replying through the props-only
+  **`ToolRenderProps.interaction`**. `ToolRendererBody` fills it through `useToolInteraction`
+  (`toolInteraction.ts`), and the plan page does the same for its card. The adapter reads `ChatActions`,
+  `interactionState` and the fold-geometry context, and fills `interaction` for every tool whose renderer
+  is registered `interactive` (`isInteractiveTool`) — it knows no tool by name. Its `state.accepting` is
+  true only while the host's `needsInput` names this call (`awaitingToolCallIdOf`, carried in the
+  interaction context; a pre-v93 host's `kind: "question"` / `question:<id>` is read the same way for one
+  compatibility window) or no host state has arrived yet, so a call the host is not waiting on (another
+  package's same-name tool, a call to the switched-off tool) cannot submit a response. `respond(value)`
+  forwards the value as is through the transport's `respondToTool` (`session.respondToTool`, or the
+  retired `session.answerQuestion` below `TOOL_RESPONSE_PROTOCOL_VERSION`); the tool validates its
+  shape. The renderer never reads those contexts itself.
+
+Worked example: the `ask_user_question` flow in [tools/SPEC.md](tools/SPEC.md).
 
 **Extension dialogs ask inside the chat, never in a modal** (`ExtUiPrompt.tsx`). Every pi
 `select`/`confirm`/`input`/`editor` request renders as an inline prompt under the shared
-`AttentionLine` ("Your input is needed · Agent is waiting", also used by `ask_user_question`): a select is
+`AttentionLine` (`@thinkrail/ui/attention-line`: "Your input is needed · Agent is waiting", also used by
+`ask_user_question`): a select is
 one button per option in the extension's order with no extra Cancel (a chat message is the escape: the
 host cancels every pending dialog when it accepts a user message, and the prompt says so in a footer
 hint — "Sending a chat message cancels this request."), confirm is Cancel/OK, input and editor a field
 plus Cancel/Submit. The title's first line is the question and names the region and its fields
 (`aria-labelledby`, the hint as `aria-describedby`); later lines are muted supporting text, so a host
-can add context without a contract field. Option buttons wrap long labels, and below a 28rem prompt
+can add context without a contract field. Option buttons (`Button outline m`, the button system's one documented wrapping exception) wrap long
+labels, and below a 28rem prompt
 (`@container` / `@max-md`) every row stacks into one column so no two choices sit side by side by
 accident (the MCP order keeps Deny furthest from Always allow). It never takes focus from the composer.
 **Arrival:** `ChatTranscript` keeps one always-mounted polite live region outside virtualization and
@@ -443,13 +464,13 @@ both message orders. *Rejected:* keeping the modal for non-MCP extensions — ev
 
 - **Transcript/shell split** — `ChatView` (the exported integration component) splits into a churn-isolated
   `ChatTranscript` child that owns the per-delta transcript rendering — subscribing (via `useShallow`) to the
-  streaming runtime fields it renders from (turns, toolResults, currentAssistantId, askAnswers,
+  streaming runtime fields it renders from (turns, toolResults, currentAssistantId, toolResponses,
   turnIdByMessageIndex, isStreaming, settlementTick, hostState, syncedConnectionGeneration, eventRevision) —
   and owns the scroll container and
   rows — plus a chrome shell that reads only granular rarely-changing fields, so text/thinking/tool deltas
   no longer re-render header/composer/queue/dialogs; completion-ack, location-reveal, and the ask-focus
-  scope live in the child (a private refactor; `ChatActions`/`AskStatesContext` are provided by
-  `ChatTranscript`). The shell still reads `turns`/`askAnswers`/`toolResults`, but only through
+  scope live in the child (a private refactor; `ChatActions`/`InteractionStatesContext` are provided by
+  `ChatTranscript`). The shell still reads `turns`/`toolResponses`/`toolResults`, but only through
   shallow-compared derived selectors (recent prompts, plan glance) that stay stable across streamed deltas,
   so it does not re-render on them.
 - **Structured tool-file navigation** — `ChatView` accepts an optional `onOpenFile(path)` from the shell and
@@ -466,8 +487,8 @@ both message orders. *Rejected:* keeping the modal for non-MCP extensions — ev
   chat — the renderer never learns workspace or session ids through props, and chat never imports panels.
 - **`ChatActions`** — a React context (provided by `ChatTranscript`, `null` standalone): how a renderer talks
   **back** to the agent — or asks the integration layer to open something — without importing
-  store/transport. Today: `answerQuestion(toolCallId, result)` —
-  it rejects when the host refuses (unknown/answered/superseded call), and the caller owns the failure UX —
+  store/transport. Today: `respondToTool(toolCallId, response)` —
+  it rejects when the host refuses (unknown/responded/superseded call), and the caller owns the failure UX —
   plus `focusComposer()`, for a renderer that resolves *itself*: it unmounts the control the user was
   standing on, and focus would otherwise fall to `<body>` and swallow every following keystroke (the same
   stranding the history overlay's dismiss refocus avoids). Only the card's own reply path calls it, and
@@ -506,16 +527,20 @@ both message orders. *Rejected:* keeping the modal for non-MCP extensions — ev
   append-only refresh preserves row identity and manual folds instead of remounting the transcript.
   Works during the run, after completion, and after a host restart (transcripts persist on disk; only
   the in-memory registry is lost — and its absence is precisely what stops the polling).
-- **`askState`** — the questionnaire lifecycle seam: the pure
-  `deriveAskStates(turns, askAnswers, toolResults)` + `AskStatesContext`/`useAskState` (provided by
-  `ChatTranscript`, and also by the plan page's `PlanAskQuestion` so the SAME `AskUserQuestionCard` can be
-  answered from the plan — see `panels/SPEC.md`; `null` standalone). A live blocking ask resolves through its native tool result; a
-  restart-repaired eligible ack resolves later through `ask-user-answers`; a live ask the user typed past
-  returns that same ack natively, so "superseded" (ack + later user turn) reads identically whether the
-  session was live or restored; a stopped/error/length result is
+- **`interactionState`** — the interactive-tool lifecycle seam: the pure
+  `deriveInteractionStates(turns, toolResponses, toolResults)` + `InteractionStatesContext`/
+  `useInteractionState` (provided by `ChatTranscript`, and also by the plan page's `PlanSessionLive` so the
+  SAME registered card can be answered from the plan — see `panels/SPEC.md`; `null` standalone). It
+  covers every tool call whose renderer is registered `interactive`; the response is opaque (`unknown`) —
+  the card reads its own shape. A live blocking call resolves through its native tool result (its
+  `details`); a restart-repaired pending marker resolves later through a `tool-response` custom message
+  (`ask-user-answers` in older transcripts); a live call the user typed past returns that same marker
+  natively, so "superseded" (pending marker + later user turn) reads identically whether the session was
+  live or restored; a stopped/error/length result is
   terminal because Pi never executes tools from a length-truncated assistant response. "Answered /
   superseded / stopped / awaiting" is therefore derived once from all three transcript
-  projections and consumed by the card and plan glance, keeping both props-driven everywhere else.
+  projections and consumed by the card (as `interaction.state`) and plan glance, keeping both
+  props-driven everywhere else.
   The same seam supplies an opaque **per-mounted-ChatView focus scope**: an awaiting card claims attention
   once within that scope (so Virtuoso remounts cannot steal focus), while a fresh mount creates a new scope
   and may focus the still-pending question again. "Fresh mount" is broader than closing/reopening the chat:
@@ -525,7 +550,7 @@ both message orders. *Rejected:* keeping the modal for non-MCP extensions — ev
   transport state.
 - **Hydration** (`hydrate.ts`) — the pure
   `messagesToRuntime(TranscriptMessage[], lastSettlement?, { idScope? })` converter (read-side counterpart
-  of the event reducer; a synthesized failure turn carries its `failure` kind and the provider message, worded at render by `errorTurnText`): rebuilds `{ turns, toolResults, askAnswers, turnIdByMessageIndex }` (a
+  of the event reducer; a synthesized failure turn carries its `failure` kind and the provider message, worded at render by `errorTurnText`): rebuilds `{ turns, toolResults, toolResponses, turnIdByMessageIndex }` (a
   `HydratedRuntime`) from a persisted transcript so a reconnecting/second client renders identically to
   the live path (same `raw` result shape). One-shot consumers keep freshly minted ids; a repeated-snapshot
   consumer supplies its session scope to derive stable role/timestamp/index ids for persisted turns. When supplied, the live summary's `lastSettlement` is authoritative; otherwise only the
@@ -545,8 +570,9 @@ both message orders. *Rejected:* keeping the modal for non-MCP extensions — ev
   `compactionSummary` (its own turn, but never a search hit — the host's index consumes the same slot, so
   the two stay aligned), and a message that
   ended in `stopReason: "error"` maps to its own assistant turn's id, never the synthesized error turn's.
-  `custom` messages: `ask-user-answers` indexes into `askAnswers` (never a turn — the questionnaire card
-  is its rendering); `subagent-completion` **becomes its own `subagentCompletion` turn** (the result
+  `custom` messages: a tool response (`readToolResponseMessage`: `tool-response`, or the retired
+  `ask-user-answers`) indexes into `toolResponses` (never a turn — the interactive tool's card is its
+  rendering); `subagent-completion` **becomes its own `subagentCompletion` turn** (the result
   row is transcript-positioned, so it maps its message index too); `todo-review-fix` **becomes its own
   `reviewFix` turn** (same positioning); unknown customTypes are ignored. No
   store/transport/shiki.
@@ -745,6 +771,13 @@ both message orders. *Rejected:* keeping the modal for non-MCP extensions — ev
   Newest-first header deltas preserve a detached historical anchor; viewport resize reevaluates the live
   percentages without moving a below-Trigger response. Initial/order placement is direct, and reduced motion
   makes every programmatic destination immediate while preserving identical state and final geometry.
+  A destination is also reached at the position the engine actually produced for it: WebKit (the macOS
+  desktop WKWebView) truncates fractional scroll writes where Chromium rounds, so a write can land almost a
+  pixel short of `GEOMETRY_EPSILON`. That evidence holds only while the requested destination, the achieved
+  position, and the scroll range are all unchanged. An instant follow step does not re-evaluate
+  synchronously; the next content change does. Judging convergence by distance alone once made a
+  reduced-motion follow re-enter itself until the stack overflowed (#1046) and kept an animated follow
+  easing forever.
 - **No hidden motion owners** — nothing but the controller and the reader may move the viewport. The
   transcript scroller opts out of browser scroll anchoring (`overflow-anchor: none`): Virtuoso excludes its
   items, but Chromium otherwise anchors to the header/footer and counter-scrolls a reader while the response
@@ -883,7 +916,8 @@ both message orders. *Rejected:* keeping the modal for non-MCP extensions — ev
   plus this catalog's untrusted aliases, so a worktree-only alias still shows — so in a chat it is the place
   to grant pi-level trust, and its `project.setTrust` carries `resources: true` exactly when it named the
   project's Pi resources), re-confirm-new, a per-group track/thumb **switch** + an **All-plugins** master, and per-skill
-  switches. Switch position plus semantic colour carries state without visible On/Off text; the switch target
+  switches. Each skill row reads as a name (card title) over its description clamped to two lines (full text
+  on hover), so a scan of similar "Use when…" lines still tells skills apart. Switch position plus semantic colour carries state without visible On/Off text; the switch target
   alone mutates, while unavailable controls keep the existing trust/parent explanation and acknowledgement
   behavior. It runs in **two modes** via an optional `workspace` prop: chat (`skills.state`, per-workspace
   skill overrides, + a **Reload** that applies changes to this chat's session via `session.reloadResources`,
@@ -915,8 +949,8 @@ both message orders. *Rejected:* keeping the modal for non-MCP extensions — ev
   keep their existing separate chrome. The slot-highlight backdrop must follow every dynamic textarea box
   change with the exact box-model and scroll-sync invariants under Template slots below.
 - **Composer trailing controls** (`Composer`) — the footer's right-hand cluster is **one solid object and
-  ghosts**, no borders: History is a ghost 28px circle (`Button variant="ghost" size="icon"` under an
-  `IconTooltip`), Stop a ghost pill (`■ Stop`, muted text lifting on a hover wash), and the send a single
+  ghosts**, no borders: History is `IconButton ghost m` (its `label` supplies the tooltip), Stop is
+  `Button ghost m` (`■ Stop`, muted text lifting on a hover wash), and the send a single
   `rounded-full` accent pill (`chat-send-pill`, `data-armed`) whose main segment (`chat-send`) carries the
   verb plus an `↩` keycap and whose chevron segment (`send-menu`, streaming only) is a second hit area
   with its own hover — spacing, not a divider, separates them. The earlier cluster was four equal bordered
@@ -925,8 +959,18 @@ both message orders. *Rejected:* keeping the modal for non-MCP extensions — ev
   `control-disabled-text` rather than the 60% primary pair — a dark accent block pulls the eye to a control
   that cannot act, and the switch to the accent fill is the "ready" signal (the exception is recorded in
   `styles/COLOR.md`). **Compact mode**: below the chat column's `@md` container width (phones, narrow
-  splits) labels and keycap hide and the pills collapse to 28px icons, so the model pill keeps its room.
+  splits) labels and keycap hide and the send pill collapses to an icon, so the model pill keeps its room.
   Labels use `ui.action`.
+- **Anthropic extra-usage notice** (`ExtraUsageNotice.tsx`, props-driven). It warns that Claude Pro/Max
+  auth bills ThinkRail's usage per token as extra usage. Both variants link only claude.ai's usage page.
+  There is no "Details" link: no pi doc explains the billing (pi's providers.md has no Claude Pro/Max
+  section), and Anthropic's help pages cover usage limits, not the third-party rule. The notice's own
+  sentence is the explanation. The `chat` variant sits above
+  the composer while the runtime's `notice` is `anthropicExtraUsage`. It is non-blocking, ✕ dismisses it
+  for that chat, and **Don't warn again** (`ChatView`: `provider.disableWarning`, then
+  `silenceNotice`, toast on failure) turns off pi's own setting. The `signIn` variant is
+  informational, for the Connect dialog ([[submodule-web-panels]]). When the host warns, and how often,
+  is [[submodule-server-agent]]'s Billing warnings.
 - **Queued messages: the pending strip** (`QueueStrip.tsx`, props-driven: `queue` + `onEdit`/`onRemove`)
   — the web mirror of pi's interactive-mode pending-messages area. A **streaming send never renders an
   optimistic transcript bubble** (see the store SPEC's echo contract): `ChatView.onSubmit` skips
@@ -957,11 +1001,9 @@ both message orders. *Rejected:* keeping the modal for non-MCP extensions — ev
   meaning + shortcut. The chevron stays enabled with an empty draft so the shortcuts remain discoverable;
   only the rows disable. Menu rows are **actions** (send the current draft with that mode), never a
   sticky mode switch — a persistent mode would make the next plain Enter silently obey hidden state.
-  `Composer` yields every keydown to an active IME before slot, menu, recall, or send handling. It uses
-  `KeyboardEvent.isComposing` plus the legacy `keyCode` 229 sentinel because `compositionend` may precede
-  the final keydown, making `isComposing` false while the IME still owns that event. The guard does not
-  cancel the event, so candidate-confirming Enter commits; only a later ordinary Enter invokes send
-  semantics.
+  `Composer` yields every keydown to an active IME before slot, menu, recall, or send handling
+  ([[module-web]]'s text-field rule). The guard does not cancel the event, so candidate-confirming
+  Enter commits; only a later ordinary Enter invokes send semantics.
   **Interrupt** (`SubmitBehavior: "interrupt"`, Cmd/Ctrl+Shift+Enter while streaming; plain send when
   idle; Shift+Enter alone stays newline) is the "take my message NOW" gesture pi lacks: `ChatView`
   awaits `session.abort` (the ack means idle) then performs an ordinary idle send — the partial reply
@@ -1426,7 +1468,7 @@ both message orders. *Rejected:* keeping the modal for non-MCP extensions — ev
   pending question never claims the user owes an answer. The glance's working/waiting lifecycle comes
   from the normalized host `SessionState` — in the TODO rail and, through `sessionGlance`, in the Plan
   and Review panels — so a chat idle on its background commands or subagents reads as working (`isSessionWorking`); the transcript-derived glance is only the older-host
-  fallback. `askStates` remains only to identify and render the exact questionnaire/recap. **Unread results clear when seen** (no per-chat read gesture; the workspace menu's mark read/unread is
+  fallback. The interaction states remain only to identify and render the exact questionnaire/recap. **Unread results clear when seen** (no per-chat read gesture; the workspace menu's mark read/unread is
   the explicit exception owned by [[submodule-web-store]]): `ChatTranscript`
   acknowledges the exact unread completion while the window has focus and is visible, the chat is
   attended (`selectChatAttended`: selected in the last-focused center group of the active workspace, no
@@ -1476,14 +1518,16 @@ none — and there is no immediate per-server stop.
 
 **New results.** `useFreshResults` tells the user a background result exists before or regardless of
 when the agent receives it (user-settled, 2026-10: "Resources announces, the chat marks receipt").
-A finished command or background (`detached`) subagent is **new** until the user opens it — its dock
-row, the inspector selection once it has finished, or its chat result row
-(`ChatActions.markResultSeen`) — or sends the next message.
-`ChatView` passes the new ones to the dock (highlighted, with dismiss) and their count to the trigger.
+A finished command or background (`detached`) subagent is **new** until the user opens it — the
+inspector selection once it has finished, or its chat result row (`ChatActions.markResultSeen`) — or
+sends the next message. `ChatView` passes their count to the dock's finished line and the trigger, and
+lands that line's Open on the newest new result, else the newest finished one (`newestResourceId`).
 The seen set is client UI state under a host-qualified localStorage key per chat: a client's first
 visit baselines everything already finished as seen (an acknowledgement before that first
 authoritative snapshot keeps the baseline pending), later visits surface what finished while away,
-and every send resets the set to the current finished list, so it stays bounded by the snapshot.
+and every send resets the set to the current finished list, so it stays bounded by the snapshot. Only the
+snapshot's window of recent finished records (`groups.recentFinished`) can be new: history paged in later
+predates every visit that could have seen it, so it never lights up.
 
 The dependency edges are `ChatView`/`useChatResources` → `resources`, `store`, `transport`,
 `BackgroundResult` → `resources` (`ResultRow`, the run label as its `metaLead`), `tools/subagent`
@@ -1492,8 +1536,16 @@ child stays props-only and imports no sibling tool implementation; it receives t
 integration hook and passed into its read-only view; the module never loads xterm.
 
 The hook hydrates on mount/current welcome, subscribes to `session.resourcesChanged`, and coalesces
-invalidations behind one in-flight read. An invalidation during a read requires a fresh pass;
-[[submodule-web-store]] owns generation/revision-fenced snapshot installation and failure handling.
+invalidations behind one in-flight read. An invalidation during a read requires a fresh pass; a failed
+read reschedules itself on the `detailPolling` transient backoff (capped, unbounded attempts) while the
+view stays mounted on the same connection, and any success, push, manual Retry or unmount resets it;
+without it one refused read (#974: a full replay namespace) left the last snapshot claiming "Working" until a
+manual Retry. A permanent failure — `RESOURCE_UNAVAILABLE` (attach failed, worktree gone) or a snapshot for
+another chat — stays visible with Retry but schedules nothing, since re-reading it every 5 s would re-attach
+the session and spend the host's error-report budget for no recovery. [[submodule-web-store]] owns generation/revision-fenced snapshot installation and
+failure handling, and `selectChatResourcesStaleness` names why a snapshot is not authoritative
+(`disconnected` socket/old protocol, a retrying `refreshFailed`, a permanent `unavailable`, or an in-flight
+`refreshing`).
 Metadata remains current while the inspector is closed; the header count is numeric only for an
 authoritative snapshot and explicitly unknown otherwise. A welcome that proves the host predates the
 capability closes the inspector and its Stop-all confirmation, while an unknown protocol during
@@ -1502,7 +1554,13 @@ is the inspector's selection. The shared `detailPolling` loop handles command ou
 single-flight replacement snapshots, stopping on terminal/permanently unavailable results, and capped
 transient backoff with visibly retryable failures. Resource controls keep pending/error state scoped
 to their action and current connection; acknowledgement and detail-close focus semantics belong to
-[[submodule-web-chat-resources]]. No per-token subagent progress or tool-result rewriting is needed
+[[submodule-web-chat-resources]]. Older history is one more such control, `loadOlder(kind)` (keyed
+`history:<kind>`, offered only by a host at `RESOURCE_HISTORY_PROTOCOL_VERSION` whose snapshot carries
+`history`): it asks `session.resourceHistory` for the page before the oldest finished record the store
+holds and hands it to the store, which keeps it only if it still continues that chain. `ChatView` owns the
+inspector's per-kind expansion beside its selection and resets both on every open; it passes the current
+new results as the inspector's `newIds` and tells the command log whether its row was interrupted and
+whether the host keeps logs (`retained`). No per-token subagent progress or tool-result rewriting is needed
 for the header count.
 
 `backgroundCommandCompletion` is a fold-breaking historical row and a round opener, recognized by the
@@ -1537,7 +1595,7 @@ Unknown custom messages retain their existing behavior.
   (**app-integration files only** — a renderer that takes props must never reach for either. Today that
   is `ChatView.tsx`, **`ChatTranscript.tsx`** (the churn-isolated transcript child — the Virtuoso list, scroll
   control, transcript sync, completion-ack, the extension-dialog reply, and the
-  `ChatActions`/`AskStatesContext`/`PendingExtUiContext` providers),
+  `ChatActions`/`InteractionStatesContext`/`PendingExtUiContext` providers),
   `chatPreferences.ts` (the client-local persistence adapter), plus the hooks and dialogs
   it composes: `useChatTodos.ts`, `useHistorySearch.ts`,
   `useModelCatalog.ts`, **`useChatResources.ts`** (the Resources hydration/control/log-read seam),
@@ -1577,7 +1635,7 @@ Unknown custom messages retain their existing behavior.
   **`useSessionStats.ts`** (the guarded read that keeps telemetry live), and
   **`TemplateEditorDialog.tsx`** (the shared template save form), the other shell integration points. Its
   churn-isolated child **`ChatTranscript`** is the second integration file: it owns the streaming runtime
-  subscription (`store.sessions[sessionId]`), provides the `ChatActions` + `AskStates` contexts, builds the
+  subscription (`store.sessions[sessionId]`), provides the `ChatActions` + `InteractionStates` contexts, builds the
   divider's deep links (`onOpenChange` → `requestChangesView`, `onOpenSpec` → `requestSpecView`; each
   receives the single path the user picked) plus its view switch (`onReveal` → the tool-reveal intent), the
   `isSpec` classifier from the store's `specsByWorkspace` snapshot (subscribed as the stored array — a
@@ -1601,8 +1659,8 @@ transcripts without the marker, a stopped command or a user-aborted subagent). S
 after settlement depending on delivery timing; one rule on both paths keeps a round's closer and divider
 ahead of it, so live and reloaded rows agree. A successful overflow `compaction_end` with
 `willRetry: true` removes the superseded errored/truncated attempt, matching Pi's rebuilt context. Tool results are
-indexed by `toolCallId` in `toolResults`; `ask-user-answers` custom messages index into `askAnswers`
-(never the turn list — the questionnaire card is their rendering); `subagent-completion` custom messages
+indexed by `toolCallId` in `toolResults`; tool-response custom messages index into `toolResponses`
+(never the turn list — the interactive tool's card is their rendering); `subagent-completion` custom messages
 append a `subagentCompletion` turn with the message `timestamp` (the shared contracts guard narrows both,
 on the live and read paths). The view re-derives rows each render
 (`deriveRows` is pure; `ChatTranscript` memoizes it, then reuses unchanged row objects via `stabilizeRows`

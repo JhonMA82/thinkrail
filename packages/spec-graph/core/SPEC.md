@@ -44,6 +44,10 @@ Acyclic and one-way: `parse` is the root, `graph` builds on it, and `query`/`val
 ## Invariants
 
 - No `@earendil-works/*` import anywhere under `core/`.
+- Grep pagination skips a zero-based match offset in source order and returns a continuation only
+  when another match exists. Callers may bound formatted bytes as well as count; one oversized first
+  match is admitted so the tool layer can preserve it outside context instead of stalling pagination.
+  The core has no Pi-sized default byte policy or output-file ownership.
 - `buildGraph` is pure (same input → same output); the index revalidates each file by `(mtimeMs, size)`,
   memoizes the graph, and never serves a stale one.
 - The glob filters each directory's entries down to the traversal candidates **first** — directories that
@@ -112,7 +116,7 @@ Acyclic and one-way: `parse` is the root, `graph` builds on it, and `query`/`val
   the `SPEC_TYPES` vocabulary constrains only the `spec_create` authoring surface, never the graph.
 - Finite vocabularies (`SPEC_TYPES`, `SPEC_STATUSES`, `SLICE_DIRECTIONS`, `LINK_KINDS`, `IDENTITY_FIELDS`)
   and frontmatter field names (the `FIELDS` registry) are single-sourced `as const` — no duplicated literal lists, so a
-  rename is a one-line change. `core/` stays typebox-free; only `tools/` wraps the tuples in `StringEnum`.
+  rename is a one-line change. `core/` stays typebox-free; only `tools/` wraps the tuples in its `stringEnum`.
 - Reads coerce frontmatter to a scalar/string-array dialect (lossy — nested maps and comments are
   dropped), which is fine for the derived model. The write path (`updateFrontmatterText`) is **lossless**:
   it mutates a live `yaml` Document in place, so untouched fields keep their order and any comments /

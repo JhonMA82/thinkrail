@@ -31,8 +31,8 @@ used), and leaves every byte of the body untouched.
   and thinkrail (`additionalExtensionPaths` / `additionalSkillPaths`) load it — plus the **`pi-spec-graph/core`
   export** (the pi-free read model), consumable by hosts (thinkrail's server) without going through the
   agent. `tools/` stays internal.
-- **Allowed deps:** `@earendil-works/pi-coding-agent`, `@earendil-works/pi-ai`, `typebox` (peer); `yaml`
-  (frontmatter parse/serialize); Node built-ins.
+- **Allowed deps:** `@earendil-works/pi-coding-agent`, `typebox` (peer); `yaml` (frontmatter
+  parse/serialize); Node built-ins.
 - **Forbidden:** any `@thinkrail/*` package — the dependency edge is one-way (thinkrail → this
   package), which is what keeps it portable.
 
@@ -88,7 +88,7 @@ pi-native prompt influence through an extension, not host prompt assembly.
 ## thinkrail integration
 
 `packages/server/src/agent/extensions.ts` layers this package into every session's
-`DefaultResourceLoader` the same way as `pi-web-access`: `require.resolve("pi-spec-graph/index.ts")` on
+`DefaultResourceLoader` in source mode: `require.resolve("pi-spec-graph/index.ts")` on
 `additionalExtensionPaths`, the package's `skills` dir on `additionalSkillPaths`. Server references it only
 by resolved path (no value import), so it stays out of server's typecheck graph. Separately,
 `packages/server/src/spec/` value-imports **`pi-spec-graph/core`** (the pi-free model — no pi packages in
